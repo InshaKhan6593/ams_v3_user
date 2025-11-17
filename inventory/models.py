@@ -1,3 +1,4 @@
+# models.py - ENHANCED VERSION
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
@@ -9,6 +10,7 @@ import base64
 from django.dispatch import receiver
 from django.db.models.signals import post_save, post_delete
 from django.db import transaction
+import json
 
 # ==================== LOCATION MODELS ====================
 class LocationType(models.TextChoices):
@@ -18,6 +20,9 @@ class LocationType(models.TextChoices):
     ROOM = 'ROOM', 'Room'
     LAB = 'LAB', 'Lab'
     JUNKYARD = 'JUNKYARD', 'Junkyard'
+    OFFICE = 'OFFICE', 'Office'
+    AV_HALL = 'AV_HALL', 'AV Hall'
+    AUDITORIUM = 'AUDITORIUM', 'Auditorium'
     OTHER = 'OTHER', 'Other'
 
 class Location(models.Model):
@@ -40,7 +45,14 @@ class Location(models.Model):
     in_charge = models.CharField(max_length=150, null=True, blank=True)
     contact_number = models.CharField(max_length=20, null=True, blank=True)
     is_active = models.BooleanField(default=True)
-
+    
+    # ENHANCED: Standalone indicates this location can have sub-locations
+    # and will get its own main store automatically
+    is_standalone = models.BooleanField(
+        default=False, 
+        help_text="If true, this location can have sub-locations and will get a main store"
+    )
+    
     created_by = models.ForeignKey(
         User,
         on_delete=models.SET_NULL,
@@ -58,6 +70,14 @@ class Location(models.Model):
         related_name='parent_location_ref'
     )
     is_auto_created = models.BooleanField(default=False)
+    is_main_store = models.BooleanField(
+        default=False, 
+        help_text="Indicates if this is the main store for its parent standalone location"
+    )
+    
+    # Hierarchy tracking
+    hierarchy_level = models.PositiveIntegerField(default=0, editable=False)
+    hierarchy_path = models.CharField(max_length=765, blank=True, editable=False)
     
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -69,91 +89,64 @@ class Location(models.Model):
             models.Index(fields=['location_type']),
             models.Index(fields=['is_store']),
             models.Index(fields=['is_active']),
+            models.Index(fields=['is_standalone']),
+            models.Index(fields=['is_main_store']),
+            models.Index(fields=['hierarchy_level']),
+            models.Index(fields=['hierarchy_path']),
         ]
 
     def __str__(self):
         return f'{self.name} ({self.code})'
     
-    def get_full_path(self):
-        """Get hierarchical path of location"""
-        path = [self.name]
-        parent = self.parent_location
-        while parent:
-            path.insert(0, parent.name)
-            parent = parent.parent_location
-        return ' > '.join(path)
-    
-    def get_main_store(self):
-        """Get the main auto-created store for this location"""
-        if self.is_store:
-            return self
-        
-        # If this location has an auto-created store, return it
-        if self.auto_created_store:
-            return self.auto_created_store
-        
-        # Otherwise, check parent location recursively
-        if self.parent_location:
-            return self.parent_location.get_main_store()
-        
-        return None
-    
-    def get_all_stores(self):
-        """Get all stores under this location including auto-created store"""
-        if self.is_store:
-            return Location.objects.filter(id=self.id)
-        
-        store_ids = set()
-        
-        # Include auto-created store
-        if self.auto_created_store:
-            store_ids.add(self.auto_created_store.id)
-        
-        # Get all child stores recursively
-        def get_child_stores(location):
-            children = location.child_locations.all()
-            for child in children:
-                if child.is_store:
-                    store_ids.add(child.id)
-                get_child_stores(child)
-        
-        get_child_stores(self)
-        return Location.objects.filter(id__in=store_ids)
-    
-    def is_standalone(self):
-        """Check if location is standalone (no parent) and not a store"""
-        return self.parent_location is None and not self.is_store
-    
-    def can_have_auto_store(self):
-        """Check if location can have an auto-created store"""
-        return self.is_standalone() and not self.is_store and not self.auto_created_store
-    
-    def get_depth(self):
-        """Get depth level in hierarchy"""
-        depth = 0
-        parent = self.parent_location
-        while parent:
-            depth += 1
-            parent = parent.parent_location
-        return depth
-    
-    def get_root_location(self):
-        """Get the root/top-level location"""
-        root = self
-        while root.parent_location:
-            root = root.parent_location
-        return root
-    
     def clean(self):
-        """Validate location data"""
+        """Enhanced validation for standalone locations and main stores"""
         super().clean()
         
-        # Store locations cannot have children
+        # RULE 1: Only one root location allowed (parent=None)
+        if not self.parent_location and self.pk:
+            existing_root = Location.objects.filter(
+                parent_location__isnull=True
+            ).exclude(pk=self.pk).exists()
+            if existing_root:
+                raise ValidationError(
+                    "Only one root location (Main University) is allowed. "
+                    "All other locations must have a parent."
+                )
+        
+        # RULE 2: Root location must be standalone
+        if not self.parent_location and not self.is_standalone:
+            raise ValidationError(
+                "Root location (Main University) must be marked as standalone"
+            )
+        
+        # RULE 3: Store locations cannot be standalone
+        if self.is_store and self.is_standalone:
+            raise ValidationError("Store locations cannot be marked as standalone")
+        
+        # RULE 4: Store locations cannot have children
         if self.is_store and self.pk:
             if self.child_locations.exists():
                 raise ValidationError("Store locations cannot have child locations")
         
-        # Prevent circular parent references
+        # RULE 5: Only one main store per standalone location
+        if self.is_main_store and self.is_store:
+            if self.pk:
+                parent_standalone = self.get_parent_standalone()
+                if parent_standalone:
+                    existing_main_stores = Location.objects.filter(
+                        is_main_store=True,
+                        is_store=True,
+                        is_active=True,
+                        parent_location=parent_standalone
+                    ).exclude(pk=self.pk)
+                    
+                    if existing_main_stores.exists():
+                        raise ValidationError(
+                            f"There can only be one main store for {parent_standalone.name}. "
+                            f"'{existing_main_stores.first().name}' is already the main store."
+                        )
+        
+        # RULE 6: Prevent circular parent references
         if self.parent_location:
             parent = self.parent_location
             visited = set()
@@ -165,27 +158,224 @@ class Location(models.Model):
                     raise ValidationError("Circular parent reference detected")
                 parent = parent.parent_location
         
-        # Auto-created stores must have parent
+        # RULE 7: Auto-created stores must have parent
         if self.is_auto_created and not self.parent_location:
             raise ValidationError("Auto-created stores must have a parent location")
         
-        # Stores cannot be parents
+        # RULE 8: Stores cannot be parents
         if self.parent_location and self.parent_location.is_store:
             raise ValidationError("Store locations cannot be parent locations")
-
-
-# Signal to auto-create store for standalone locations
-@receiver(post_save, sender=Location)
-def auto_create_store_for_location(sender, instance, created, **kwargs):
-    """
-    Automatically create a store location for standalone non-parent locations
-    """
-    if created and instance.can_have_auto_store():
-        # Generate store code and name
-        store_code = f"{instance.code}-STORE"
-        store_name = f"{instance.name} - Central Store"
         
-        # Create the store
+        # RULE 9: Only stores can be main stores
+        if self.is_main_store and not self.is_store:
+            raise ValidationError("Only store locations can be marked as main stores")
+        
+        # RULE 10: Main stores must be auto-created for standalone locations
+        if self.is_main_store and not self.is_auto_created and self.parent_location:
+            if not self.parent_location.is_standalone:
+                raise ValidationError("Main stores can only be created for standalone locations")
+    
+    def save(self, *args, **kwargs):
+        # Calculate hierarchy level and path
+        if self.parent_location:
+            self.hierarchy_level = self.parent_location.hierarchy_level + 1
+            self.hierarchy_path = f"{self.parent_location.hierarchy_path}/{self.code}"
+        else:
+            # Root location
+            self.hierarchy_level = 0
+            self.hierarchy_path = self.code
+        
+        super().save(*args, **kwargs)
+    
+    def get_full_path(self):
+        """Get hierarchical path of location"""
+        path = [self.name]
+        parent = self.parent_location
+        while parent:
+            path.insert(0, parent.name)
+            parent = parent.parent_location
+        return ' > '.join(path)
+    
+    def get_depth(self):
+        """Calculate the depth of this location in the hierarchy"""
+        return self.hierarchy_level
+    
+    def get_parent_standalone(self):
+        """
+        Get the parent standalone location for this location.
+        This is crucial for determining permissions and main store.
+        """
+        if self.is_standalone:
+            return self
+        
+        if not self.parent_location:
+            return None
+        
+        # Traverse up until we find a standalone location
+        current = self.parent_location
+        while current:
+            if current.is_standalone:
+                return current
+            current = current.parent_location
+        
+        return None
+    
+    def get_main_store(self):
+        """
+        Get the main store for this location's hierarchy.
+        - If this is standalone, return its auto-created main store
+        - If not standalone, find parent standalone and return its main store
+        """
+        if self.is_store and self.is_main_store:
+            return self
+        
+        # If this is standalone, return its auto-created store
+        if self.is_standalone and self.auto_created_store:
+            return self.auto_created_store
+        
+        # Otherwise, find parent standalone location
+        parent_standalone = self.get_parent_standalone()
+        if parent_standalone and parent_standalone.auto_created_store:
+            return parent_standalone.auto_created_store
+        
+        return None
+    
+    def get_all_stores(self):
+        """Get all stores under this location including auto-created main store"""
+        stores = []
+        
+        # Include auto-created main store
+        if self.auto_created_store:
+            stores.append(self.auto_created_store)
+        
+        # Get all child stores recursively
+        def get_child_stores(location):
+            children = location.child_locations.filter(is_active=True)
+            for child in children:
+                if child.is_store:
+                    stores.append(child)
+                else:
+                    # Only recurse into non-store locations
+                    get_child_stores(child)
+        
+        get_child_stores(self)
+        return Location.objects.filter(id__in=[store.id for store in stores])
+    
+    def is_descendant_of(self, location):
+        """Check if this location is a descendant of the given location"""
+        return self.hierarchy_path.startswith(f"{location.hierarchy_path}/")
+    
+    def get_root_location(self):
+        """Get the root location (Main University)"""
+        if not self.parent_location:
+            return self
+        
+        # Use hierarchy_path to find root efficiently
+        root_code = self.hierarchy_path.split('/')[0]
+        return Location.objects.filter(code=root_code, parent_location__isnull=True).first()
+    
+    def get_descendants(self, include_self=False):
+        """Get all descendants using hierarchy_path for efficient querying"""
+        if include_self:
+            return Location.objects.filter(
+                hierarchy_path__startswith=self.hierarchy_path,
+                is_active=True
+            )
+        return Location.objects.filter(
+            hierarchy_path__startswith=f"{self.hierarchy_path}/",
+            is_active=True
+        )
+    
+    def get_immediate_children(self):
+        """Get immediate children only"""
+        return self.child_locations.filter(is_active=True)
+    
+    def get_standalone_children(self):
+        """Get only standalone children (departments, buildings, etc.)"""
+        return self.child_locations.filter(is_standalone=True, is_active=True)
+    
+    def can_have_sub_locations(self):
+        """
+        Determine if this location type can have sub-locations.
+        Only standalone locations can have meaningful sub-locations.
+        """
+        return self.is_standalone
+    
+    def can_transfer_to(self, target_location):
+        """
+        Enhanced transfer logic:
+        - Main store can transfer UP to parent standalone location
+        - Main store can transfer to any location within its hierarchy
+        - Regular stores can transfer within same hierarchy only
+        """
+        if not self.is_store:
+            return False
+        
+        # Get parent standalone locations
+        self_parent_standalone = self.get_parent_standalone()
+        target_parent_standalone = target_location.get_parent_standalone()
+        
+        # Same hierarchy: always allowed
+        if self_parent_standalone == target_parent_standalone:
+            return True
+        
+        # SPECIAL RULE: Main store can transfer UP to parent standalone location
+        if self.is_main_store and self_parent_standalone:
+            # Check if target is the direct parent standalone location
+            if self_parent_standalone.parent_location:
+                parent_of_parent_standalone = self_parent_standalone.parent_location.get_parent_standalone()
+                if target_location == parent_of_parent_standalone:
+                    return True
+        
+        return False
+    
+    def can_issue_to_parent_standalone(self):
+        """
+        Check if this store (must be main store) can issue to parent standalone location.
+        This is the special permission for main stores.
+        """
+        if not self.is_store or not self.is_main_store:
+            return False
+        
+        parent_standalone = self.get_parent_standalone()
+        if not parent_standalone or not parent_standalone.parent_location:
+            return False
+        
+        # Can issue to parent's parent standalone
+        return True
+    
+    def get_parent_standalone_for_issuance(self):
+        """
+        Get the parent standalone location this main store can issue to.
+        Returns None if not applicable.
+        """
+        if not self.can_issue_to_parent_standalone():
+            return None
+        
+        parent_standalone = self.get_parent_standalone()
+        if parent_standalone and parent_standalone.parent_location:
+            return parent_standalone.parent_location.get_parent_standalone()
+        
+        return None
+
+    @property
+    def is_root_location(self):
+        """Check if this is the root location (Main University)"""
+        return self.parent_location is None
+
+# Signal to auto-create main store for standalone locations
+@receiver(post_save, sender=Location)
+def auto_create_store_for_standalone(sender, instance, created, **kwargs):
+    """
+    Automatically create a main store for standalone locations.
+    This includes the root location (Main University) and any department/building marked as standalone.
+    """
+    if created and instance.is_standalone and not instance.is_store:
+        # Generate store code and name
+        store_code = f"{instance.code}-MAIN-STORE"
+        store_name = f"{instance.name} - Main Store"
+        
+        # Create the main store
         store = Location.objects.create(
             name=store_name,
             code=store_code,
@@ -193,11 +383,14 @@ def auto_create_store_for_location(sender, instance, created, **kwargs):
             location_type=LocationType.STORE,
             is_store=True,
             is_auto_created=True,
-            description=f"Auto-created central store for {instance.name}",
+            is_main_store=True,
+            is_standalone=False,
+            description=f"Auto-created main store for {instance.name}",
             address=instance.address,
             in_charge=instance.in_charge,
             contact_number=instance.contact_number,
-            is_active=True
+            is_active=True,
+            created_by=instance.created_by
         )
         
         # Link back to parent
@@ -208,18 +401,20 @@ def auto_create_store_for_location(sender, instance, created, **kwargs):
         try:
             from user_management.models import UserActivity
             UserActivity.objects.create(
-                user=None,
-                action='AUTO_CREATE_STORE',
+                user=instance.created_by,
+                action='AUTO_CREATE_MAIN_STORE',
                 model='Location',
                 object_id=store.id,
                 details={
                     'parent_location': instance.name,
                     'store_name': store_name,
-                    'store_code': store_code
+                    'store_code': store_code,
+                    'is_main_store': True,
+                    'is_standalone_parent': True
                 }
             )
         except:
-            pass  # Fail silently if UserActivity doesn't exist yet
+            pass
 
 # ==================== CATEGORY AND ITEM MODELS ====================
 class Category(models.Model):
@@ -250,11 +445,16 @@ class Item(models.Model):
     description = models.TextField(blank=True, null=True)
     acct_unit = models.CharField(max_length=255, help_text="Accounting unit/measurement")
     specifications = models.TextField(blank=True, null=True)
+    
+    # ENHANCED: default_location must be a standalone location
     default_location = models.ForeignKey(
         Location, 
         on_delete=models.PROTECT,
-        related_name='default_items'
+        related_name='default_items',
+        limit_choices_to={'is_standalone': True},
+        help_text="Must be a standalone location (Department, Main University, etc.)"
     )
+    
     total_quantity = models.PositiveIntegerField(default=0)
     reorder_level = models.PositiveIntegerField(default=0)
     reorder_quantity = models.PositiveIntegerField(default=0)
@@ -279,11 +479,17 @@ class Item(models.Model):
     def __str__(self):
         return f"{self.name} ({self.code})"
     
+    def clean(self):
+        """Validate that default_location is standalone"""
+        if self.default_location and not self.default_location.is_standalone:
+            raise ValidationError({
+                'default_location': "Items must belong to a standalone location (Department, Main University, etc.)"
+            })
+    
     def update_total_quantity(self):
         """Update total quantity based on instances"""
         self.total_quantity = self.instances.count()
         self.save(update_fields=['total_quantity'])
-
 
 # ==================== INSPECTION CERTIFICATE MODELS ====================
 class InspectionStage(models.TextChoices):
@@ -311,12 +517,16 @@ class InspectionCertificate(models.Model):
     contractor_address = models.TextField(blank=True, null=True)
     indenter = models.CharField(max_length=150)
     indent_no = models.CharField(max_length=100)
+    
+    # ENHANCED: department must be standalone location
     department = models.ForeignKey(
         Location,
         on_delete=models.PROTECT,
         related_name='department_certificates',
-        help_text="The location where this certificate is initiated"
+        limit_choices_to={'is_standalone': True},
+        help_text="Must be a standalone location (Department, Main University, etc.)"
     )
+    
     date_of_delivery = models.DateField(null=True, blank=True)
     delivery_type = models.CharField(
         max_length=20, 
@@ -462,6 +672,13 @@ class InspectionCertificate(models.Model):
             self.status = 'IN_PROGRESS'
         
         super().save(*args, **kwargs)
+    
+    def clean(self):
+        """Validate that department is standalone"""
+        if self.department and not self.department.is_standalone:
+            raise ValidationError({
+                'department': "Inspection certificates must be for standalone locations only"
+            })
 
     def get_main_store(self):
         """Get the main store for this certificate's department"""
@@ -481,15 +698,12 @@ class InspectionCertificate(models.Model):
         if user_profile.role == UserRole.SYSTEM_ADMIN:
             return True
         
-        # Once submitted to next stage, previous user cannot edit
         if stage == InspectionStage.INITIATED:
-            # Can edit only if still in INITIATED stage
             return (self.stage == InspectionStage.INITIATED and
                    user_profile.role == UserRole.LOCATION_HEAD and 
                    user_profile.has_location_access(self.department))
         
         elif stage == InspectionStage.STOCK_DETAILS:
-            # Can edit only if in STOCK_DETAILS stage
             main_store = self.get_main_store()
             return (self.stage == InspectionStage.STOCK_DETAILS and
                    user_profile.role == UserRole.STOCK_INCHARGE and 
@@ -497,7 +711,6 @@ class InspectionCertificate(models.Model):
                    user_profile.has_location_access(main_store))
         
         elif stage == InspectionStage.AUDIT_REVIEW:
-            # Can edit only if in AUDIT_REVIEW stage
             return (self.stage == InspectionStage.AUDIT_REVIEW and
                    user_profile.role == UserRole.AUDITOR)
         
@@ -577,7 +790,7 @@ class InspectionItem(models.Model):
     remarks = models.TextField(blank=True, null=True)
     unit_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     
-    # Stock register details (added by Stock Incharge for each item)
+    # Stock register details
     stock_register_no = models.CharField(max_length=100, blank=True, null=True)
     stock_register_page_no = models.CharField(max_length=50, blank=True, null=True)
     stock_entry_date = models.DateField(null=True, blank=True)
@@ -593,16 +806,12 @@ class InspectionItem(models.Model):
         return f"{self.item.name} - {self.inspection_certificate.certificate_no}"
     
     def clean(self):
-        from django.core.exceptions import ValidationError
         if (self.accepted_quantity + self.rejected_quantity) > self.tendered_quantity:
             raise ValidationError(
                 "Accepted + Rejected quantity cannot exceed tendered quantity"
             )
 
 # ==================== ITEM INSTANCE MODEL ====================
-# ==================== ADD/UPDATE THESE IN YOUR models.py ====================
-
-# UPDATED InstanceStatus - Replace your existing one
 class InstanceStatus(models.TextChoices):
     IN_STORE = 'IN_STORE', 'In Store'
     IN_TRANSIT = 'IN_TRANSIT', 'In Transit'
@@ -614,8 +823,6 @@ class InstanceStatus(models.TextChoices):
     CONDEMNED = 'CONDEMNED', 'Condemned'
     DISPOSED = 'DISPOSED', 'Disposed'
 
-
-# UPDATED ItemInstance Model - Replace your existing ItemInstance class
 class ItemInstance(models.Model):
     item = models.ForeignKey('Item', on_delete=models.PROTECT, related_name='instances')
     inspection_certificate = models.ForeignKey(
@@ -648,11 +855,12 @@ class ItemInstance(models.Model):
         related_name='status_changed_instances'
     )
     
-    # Location tracking
+    # ENHANCED: source_location must be a store (main store typically)
     source_location = models.ForeignKey(
         'Location', 
         on_delete=models.PROTECT, 
-        related_name='source_instances'
+        related_name='source_instances',
+        limit_choices_to={'is_store': True}
     )
     current_location = models.ForeignKey(
         'Location', 
@@ -716,6 +924,9 @@ class ItemInstance(models.Model):
     purchase_date = models.DateField(null=True, blank=True)
     warranty_expiry = models.DateField(null=True, blank=True)
     
+    # Enhanced QR data
+    qr_data_json = models.JSONField(default=dict, blank=True)
+    
     notes = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -772,17 +983,43 @@ class ItemInstance(models.Model):
         return f"{self.item.code}-{year}-{new_seq:04d}"
     
     def generate_qr_code(self):
+        """Generate QR code with comprehensive instance information"""
         import qrcode
         from io import BytesIO
         import base64
         
-        qr = qrcode.QRCode(version=1, box_size=10, border=5)
         qr_data = {
             'instance_code': self.instance_code,
             'item_name': self.item.name,
             'item_code': self.item.code,
+            'item_description': self.item.description,
+            'category': self.item.category.name if self.item.category else None,
+            'specifications': self.item.specifications,
+            'current_status': self.current_status,
+            'current_status_display': self.get_current_status_display(),
+            'current_location': self.current_location.name,
+            'current_location_code': self.current_location.code,
+            'source_location': self.source_location.name,
+            'source_location_code': self.source_location.code,
+            'condition': self.condition,
+            'purchase_date': str(self.purchase_date) if self.purchase_date else None,
+            'warranty_expiry': str(self.warranty_expiry) if self.warranty_expiry else None,
+            'created_at': str(self.created_at),
+            'inspection_certificate': self.inspection_certificate.certificate_no if self.inspection_certificate else None,
+            'assigned_to': self.assigned_to,
+            'expected_return_date': str(self.expected_return_date) if self.expected_return_date else None,
+            'last_updated': str(self.updated_at)
         }
-        qr.add_data(str(qr_data))
+        
+        self.qr_data_json = qr_data
+        
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_L,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(json.dumps(qr_data, indent=2))
         qr.make(fit=True)
         
         img = qr.make_image(fill_color="black", back_color="white")
@@ -792,6 +1029,13 @@ class ItemInstance(models.Model):
         
         self.qr_code_data = f"data:image/png;base64,{img_str}"
         self.qr_generated = True
+    
+    def get_qr_info(self):
+        """Get comprehensive QR code information"""
+        if not self.qr_data_json:
+            self.generate_qr_code()
+            self.save()
+        return self.qr_data_json
     
     def change_status(self, new_status, user, location=None, notes=None):
         """Change instance status with proper tracking"""
@@ -850,42 +1094,13 @@ class ItemInstance(models.Model):
             return timezone.now().date() > self.expected_return_date
         return False
 
-# ADD THESE SIGNALS at the end of models.py
-@receiver(post_save, sender=ItemInstance)
-def update_inventory_on_instance_change(sender, instance, created, **kwargs):
-    """Auto-update inventory when instance changes"""
-    try:
-        if instance.source_location and instance.source_location.is_store:
-            inv, _ = LocationInventory.objects.get_or_create(
-                location=instance.source_location,
-                item=instance.item
-            )
-            inv.update_quantities()
-    except Exception as e:
-        pass
-
-
-@receiver(post_delete, sender=ItemInstance)
-def update_inventory_on_delete(sender, instance, **kwargs):
-    """Update item total quantity when an instance is deleted"""
-    try:
-        instance.item.update_total_quantity()
-        if instance.source_location and instance.source_location.is_store:
-            inv = LocationInventory.objects.filter(
-                location=instance.source_location,
-                item=instance.item
-            ).first()
-            if inv:
-                inv.update_quantities()
-    except:
-        pass
-
 # ==================== STOCK ENTRY MODEL ====================
 class StockEntry(models.Model):
     ENTRY_TYPE_CHOICES = [
         ('RECEIPT', 'Receipt'),
         ('ISSUE', 'Issue'),
         ('CORRECTION', 'Correction'),
+        ('RETURN', 'Return'),
     ]
 
     STATUS_CHOICES = [
@@ -903,7 +1118,8 @@ class StockEntry(models.Model):
         on_delete=models.PROTECT, 
         null=True, 
         blank=True, 
-        related_name='outgoing_entries'
+        related_name='outgoing_entries',
+        limit_choices_to={'is_store': True}
     )
     to_location = models.ForeignKey(
         Location, 
@@ -933,6 +1149,15 @@ class StockEntry(models.Model):
         blank=True, 
         related_name='stock_entries'
     )
+    
+    # Enhanced transfer tracking
+    requires_acknowledgment = models.BooleanField(default=False)
+    is_cross_location = models.BooleanField(default=False)
+    is_upward_transfer = models.BooleanField(
+        default=False,
+        help_text="True if this is a main store issuing UP to parent standalone location"
+    )
+    
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='DRAFT')
     created_by = models.ForeignKey(
         User, 
@@ -963,6 +1188,8 @@ class StockEntry(models.Model):
             models.Index(fields=['entry_type']),
             models.Index(fields=['status']),
             models.Index(fields=['entry_date']),
+            models.Index(fields=['requires_acknowledgment']),
+            models.Index(fields=['is_upward_transfer']),
         ]
 
     def __str__(self):
@@ -971,6 +1198,12 @@ class StockEntry(models.Model):
     def save(self, *args, **kwargs):
         if not self.entry_number:
             self.entry_number = self.generate_entry_number()
+        
+        # Determine if acknowledgment is required
+        self.requires_acknowledgment = self._check_acknowledgment_required()
+        self.is_cross_location = self._check_cross_location()
+        self.is_upward_transfer = self._check_upward_transfer()
+        
         super().save(*args, **kwargs)
     
     def generate_entry_number(self):
@@ -987,6 +1220,54 @@ class StockEntry(models.Model):
                 last_seq = 0
         
         return f"{self.entry_type}-{today}-{last_seq + 1:04d}"
+    
+    def _check_acknowledgment_required(self):
+        """Determine if this entry requires acknowledgment"""
+        if self.entry_type == 'ISSUE':
+            # Store-to-store transfers require acknowledgment
+            if (self.from_location and self.from_location.is_store and 
+                self.to_location and self.to_location.is_store):
+                return True
+            
+            # Upward transfers (main store to parent standalone) require acknowledgment
+            if self._check_upward_transfer():
+                return True
+        
+        elif self.entry_type == 'RETURN':
+            # Returns to store require acknowledgment
+            if self.to_location and self.to_location.is_store:
+                return True
+        
+        return False
+    
+    def _check_cross_location(self):
+        """Check if this is a cross-location transfer"""
+        if self.from_location and self.to_location:
+            from_parent_standalone = self.from_location.get_parent_standalone()
+            to_parent_standalone = self.to_location.get_parent_standalone()
+            return from_parent_standalone != to_parent_standalone
+        return False
+    
+    def _check_upward_transfer(self):
+        """Check if this is an upward transfer (main store to parent standalone)"""
+        if self.entry_type != 'ISSUE' or not self.from_location or not self.to_location:
+            return False
+        
+        # Check if from_location is a main store
+        if not (self.from_location.is_store and self.from_location.is_main_store):
+            return False
+        
+        # Check if to_location is the parent standalone location
+        from_parent_standalone = self.from_location.get_parent_standalone()
+        if not from_parent_standalone:
+            return False
+        
+        # Get parent of from_parent_standalone
+        if from_parent_standalone.parent_location:
+            parent_of_parent_standalone = from_parent_standalone.parent_location.get_parent_standalone()
+            return self.to_location == parent_of_parent_standalone
+        
+        return False
 
 # ==================== INVENTORY MODEL ====================
 class LocationInventory(models.Model):
@@ -1001,15 +1282,15 @@ class LocationInventory(models.Model):
     # Status quantity fields
     total_quantity = models.PositiveIntegerField(default=0)
     available_quantity = models.PositiveIntegerField(default=0)
-    in_store_quantity = models.PositiveIntegerField(default=0)  # ADD THIS
+    in_store_quantity = models.PositiveIntegerField(default=0)
     in_transit_quantity = models.PositiveIntegerField(default=0)
     in_use_quantity = models.PositiveIntegerField(default=0)
     temporary_issued_quantity = models.PositiveIntegerField(default=0)
-    under_repair_quantity = models.PositiveIntegerField(default=0)  # ADD THIS
-    damaged_quantity = models.PositiveIntegerField(default=0)  # ADD THIS
-    lost_quantity = models.PositiveIntegerField(default=0)  # ADD THIS
-    condemned_quantity = models.PositiveIntegerField(default=0)  # ADD THIS
-    disposed_quantity = models.PositiveIntegerField(default=0)  # ADD THIS
+    under_repair_quantity = models.PositiveIntegerField(default=0)
+    damaged_quantity = models.PositiveIntegerField(default=0)
+    lost_quantity = models.PositiveIntegerField(default=0)
+    condemned_quantity = models.PositiveIntegerField(default=0)
+    disposed_quantity = models.PositiveIntegerField(default=0)
     
     last_updated = models.DateTimeField(auto_now=True)
 
@@ -1025,8 +1306,6 @@ class LocationInventory(models.Model):
     
     def update_quantities(self):
         """Update all quantity fields based on instances"""
-        # CRITICAL: Count instances where THIS location is the SOURCE
-        # These are instances that "belong" to this inventory
         source_instances = ItemInstance.objects.filter(
             item=self.item,
             source_location=self.location
@@ -1034,10 +1313,9 @@ class LocationInventory(models.Model):
         
         self.total_quantity = source_instances.count()
         
-        # Count by status for instances sourced from this location
         self.in_store_quantity = source_instances.filter(
             current_status=InstanceStatus.IN_STORE,
-            current_location=self.location  # Must also be physically here
+            current_location=self.location
         ).count()
         
         self.in_transit_quantity = source_instances.filter(
@@ -1072,8 +1350,6 @@ class LocationInventory(models.Model):
             current_status=InstanceStatus.DISPOSED
         ).count()
         
-        # Available = instances currently at this location in IN_STORE status
-        # regardless of source (includes items transferred here)
         self.available_quantity = ItemInstance.objects.filter(
             item=self.item,
             current_location=self.location,
@@ -1081,6 +1357,8 @@ class LocationInventory(models.Model):
         ).count()
         
         self.save()
+
+# ==================== INSTANCE MOVEMENT MODEL ====================
 class InstanceMovement(models.Model):
     instance = models.ForeignKey(
         ItemInstance, 
@@ -1116,6 +1394,7 @@ class InstanceMovement(models.Model):
             ('ISSUE', 'Issue'),
             ('RETURN', 'Return'),
             ('TRANSFER', 'Transfer'),
+            ('UPWARD_TRANSFER', 'Upward Transfer'),
             ('REPAIR', 'Send to Repair'),
             ('REPAIR_RETURN', 'Return from Repair'),
             ('DAMAGE', 'Mark as Damaged'),
@@ -1144,12 +1423,70 @@ class InstanceMovement(models.Model):
         related_name='acknowledged_movements'
     )
     acknowledged_at = models.DateTimeField(null=True, blank=True)
+    
+    # Enhanced tracking
+    is_cross_location = models.BooleanField(default=False)
+    is_upward_transfer = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-moved_at']
         indexes = [
             models.Index(fields=['instance', '-moved_at']),
+            models.Index(fields=['requires_acknowledgment']),
+            models.Index(fields=['is_upward_transfer']),
         ]
 
     def __str__(self):
         return f"{self.instance.instance_code}: {self.get_previous_status_display()} → {self.get_new_status_display()}"
+
+# ==================== SIGNALS ====================
+@receiver(post_save, sender=ItemInstance)
+def update_inventory_on_instance_change(sender, instance, created, **kwargs):
+    """Auto-update inventory when instance changes"""
+    try:
+        if instance.source_location and instance.source_location.is_store:
+            inv, _ = LocationInventory.objects.get_or_create(
+                location=instance.source_location,
+                item=instance.item
+            )
+            inv.update_quantities()
+        
+        if (instance.current_location and instance.current_location.is_store and 
+            instance.current_location != instance.source_location):
+            inv, _ = LocationInventory.objects.get_or_create(
+                location=instance.current_location,
+                item=instance.item
+            )
+            inv.update_quantities()
+    except Exception as e:
+        print(f"Error updating inventory: {e}")
+
+@receiver(post_delete, sender=ItemInstance)
+def update_inventory_on_delete(sender, instance, **kwargs):
+    """Update item total quantity when an instance is deleted"""
+    try:
+        instance.item.update_total_quantity()
+        if instance.source_location and instance.source_location.is_store:
+            inv = LocationInventory.objects.filter(
+                location=instance.source_location,
+                item=instance.item
+            ).first()
+            if inv:
+                inv.update_quantities()
+    except Exception as e:
+        print(f"Error updating inventory on delete: {e}")
+
+@receiver(post_save, sender=StockEntry)
+def update_inventory_on_stock_entry(sender, instance, created, **kwargs):
+    """Update inventory when stock entry is completed"""
+    try:
+        if instance.status == 'COMPLETED':
+            for location in [instance.from_location, instance.to_location]:
+                if location and location.is_store:
+                    inv, _ = LocationInventory.objects.get_or_create(
+                        location=location,
+                        item=instance.item
+                    )
+                    inv.update_quantities()
+    except Exception as e:
+        print(f"Error updating inventory from stock entry: {e}")

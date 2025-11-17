@@ -1,3 +1,4 @@
+# permissions.py - ENHANCED VERSION
 from rest_framework import permissions
 from user_management.models import UserRole
 
@@ -5,7 +6,8 @@ from user_management.models import UserRole
 class CanManageUsers(permissions.BasePermission):
     """
     Permission for user management operations.
-    Location Head can create Stock Incharge users for stores within their location.
+    - SYSTEM_ADMIN: Can manage all users
+    - LOCATION_HEAD: Can create Stock Incharge for stores in their hierarchy
     """
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -59,10 +61,10 @@ class CanManageUsers(permissions.BasePermission):
 
 class HasLocationAccess(permissions.BasePermission):
     """
-    Permission for location-based operations.
-    - System Admin: Full access to all locations
-    - Location Head: Can create and manage locations within their hierarchy
-    - Stock Incharge: Can create locations within their assigned main locations (stores)
+    Permission for location-based operations with standalone location awareness.
+    - SYSTEM_ADMIN: Full access to all locations
+    - LOCATION_HEAD: Can create and manage locations within their standalone hierarchy
+    - STOCK_INCHARGE: Can create locations within their hierarchy
     """
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -86,7 +88,7 @@ class HasLocationAccess(permissions.BasePermission):
             if view.action in ['create', 'update', 'partial_update', 'destroy']:
                 return True
         
-        # Stock Incharge can create locations (within their main location)
+        # Stock Incharge can create locations (within their hierarchy)
         if profile.role == UserRole.STOCK_INCHARGE:
             if view.action in ['create', 'update', 'partial_update']:
                 return True
@@ -118,23 +120,19 @@ class HasLocationAccess(permissions.BasePermission):
         if profile.role == UserRole.LOCATION_HEAD:
             return True
         
-        # Stock Incharge can modify locations within their assigned stores/main location
+        # Stock Incharge can modify locations within their hierarchy
         if profile.role == UserRole.STOCK_INCHARGE:
-            # Stock Incharge can modify locations that are under their main location
-            main_location = profile.get_main_location()
-            if main_location:
-                # Check if this location is under the main location hierarchy
-                return obj.is_descendant_of(main_location) or obj.id == main_location.id
-            return False
+            return True
         
         return False
 
+
 class CanManageItems(permissions.BasePermission):
     """
-    Permission for item management.
-    - System Admin: Full access to all items
-    - Location Head: Can create items for their main location (root/no parent)
-    - Stock Incharge: Can create items
+    Permission for item management with standalone location awareness.
+    - SYSTEM_ADMIN: Full access to all items
+    - LOCATION_HEAD: Can create items for their standalone location
+    - STOCK_INCHARGE: Can create items for their parent standalone location
     """
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
@@ -155,7 +153,7 @@ class CanManageItems(permissions.BasePermission):
         
         # Location Head and Stock Incharge can create items
         if view.action == 'create':
-            return profile.role in [UserRole.LOCATION_HEAD, UserRole.STOCK_INCHARGE]
+            return profile.can_create_item()
         
         # Only System Admin can update/delete
         if view.action in ['update', 'partial_update', 'destroy']:
@@ -186,14 +184,12 @@ class CanManageItems(permissions.BasePermission):
 
 class InspectionCertificatePermission(permissions.BasePermission):
     """
-    Permission for inspection certificate operations.
-    Flow: Location Head creates → Stock Incharge (main store) reviews → Auditor approves
+    Permission for inspection certificate operations with standalone location awareness.
+    Flow: Location Head (standalone) creates → Stock Incharge (main store) reviews → Auditor approves
     """
     
     def has_permission(self, request, view):
-        """
-        Check if user has permission to perform the ACTION.
-        """
+        """Check if user has permission to perform the ACTION."""
         if not request.user or not request.user.is_authenticated:
             return False
         
@@ -210,9 +206,9 @@ class InspectionCertificatePermission(permissions.BasePermission):
         if view.action in ['list', 'retrieve', 'dashboard_stats']:
             return True
         
-        # Create action
+        # Create action - only Location Head of standalone locations
         if view.action == 'create':
-            return profile.role in [UserRole.LOCATION_HEAD, UserRole.SYSTEM_ADMIN]
+            return profile.can_create_inspection_certificates()
         
         # Update actions - check basic permission, detailed check in has_object_permission
         if view.action in ['update', 'partial_update']:
@@ -235,9 +231,7 @@ class InspectionCertificatePermission(permissions.BasePermission):
         return False
     
     def has_object_permission(self, request, view, obj):
-        """
-        Check if user has permission to access THIS SPECIFIC OBJECT.
-        """
+        """Check if user has permission to access THIS SPECIFIC OBJECT."""
         if not request.user or not request.user.is_authenticated:
             return False
         
@@ -311,9 +305,7 @@ class InspectionCertificatePermission(permissions.BasePermission):
 
 
 class IsSystemAdminOrReadOnly(permissions.BasePermission):
-    """
-    Only System Admin can edit, others have read-only access
-    """
+    """Only System Admin can edit, others have read-only access"""
     def has_permission(self, request, view):
         if not request.user or not request.user.is_authenticated:
             return False
@@ -331,7 +323,10 @@ class IsSystemAdminOrReadOnly(permissions.BasePermission):
 
 class CanManageStockEntry(permissions.BasePermission):
     """
-    Permission for managing stock entries
+    Permission for managing stock entries with upward transfer support.
+    - SYSTEM_ADMIN: Full access
+    - STOCK_INCHARGE: Can create/manage entries for their stores
+    - Main Store Incharge: Can also issue upward to parent standalone
     """
     
     def has_permission(self, request, view):
@@ -347,8 +342,8 @@ class CanManageStockEntry(permissions.BasePermission):
         if profile.role in [UserRole.SYSTEM_ADMIN, UserRole.AUDITOR]:
             return True
         
-        # Stock Incharge and Location Head can create/view their own
-        if profile.role in [UserRole.STOCK_INCHARGE, UserRole.LOCATION_HEAD]:
+        # Stock Incharge can create/view their own
+        if profile.role == UserRole.STOCK_INCHARGE:
             return True
         
         return False
@@ -366,7 +361,7 @@ class CanManageStockEntry(permissions.BasePermission):
         if profile.role == UserRole.SYSTEM_ADMIN:
             return True
         
-        # For acknowledge_receipt and acknowledge_return actions
+        # For acknowledge actions
         if view.action in ['acknowledge_receipt', 'acknowledge_return']:
             # User must have access to the destination location (to_location)
             if obj.to_location:
@@ -386,15 +381,10 @@ class CanManageStockEntry(permissions.BasePermission):
                 return True
             if obj.to_location and obj.to_location in accessible_stores:
                 return True
-        
-        # Location Head can view entries related to their locations
-        if profile.role == UserRole.LOCATION_HEAD:
-            accessible_locations = profile.get_accessible_locations()
             
-            if request.method in permissions.SAFE_METHODS:
-                if obj.from_location and obj.from_location in accessible_locations:
-                    return True
-                if obj.to_location and obj.to_location in accessible_locations:
-                    return True
+            # Special case: Upward transfers to parent standalone
+            # Stock Incharge of main store can view entries targeting parent standalone
+            if obj.is_upward_transfer and profile.is_main_store_incharge():
+                return True
         
         return False

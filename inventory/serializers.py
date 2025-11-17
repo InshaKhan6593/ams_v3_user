@@ -1,3 +1,4 @@
+# serializers.py - ENHANCED VERSION
 from rest_framework import serializers
 from django.utils import timezone
 from django.contrib.auth.models import User
@@ -34,7 +35,7 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class UserProfileSerializer(serializers.ModelSerializer):
-    user = UserSerializer(read_only=True)
+    user = serializers.SerializerMethodField(read_only=True)
     username = serializers.CharField(write_only=True, required=False)
     password = serializers.CharField(write_only=True, required=False, style={'input_type': 'password'})
     email = serializers.EmailField(write_only=True, required=False)
@@ -44,34 +45,117 @@ class UserProfileSerializer(serializers.ModelSerializer):
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
     department_name = serializers.CharField(source='department.name', read_only=True)
     role_display = serializers.CharField(source='get_role_display', read_only=True)
-    can_create_users = serializers.SerializerMethodField()
-    can_create_locations = serializers.SerializerMethodField()
-    main_location = serializers.SerializerMethodField()
+    
+    # Enhanced fields
+    responsible_location = serializers.SerializerMethodField()
+    allowed_assignment_locations = serializers.SerializerMethodField()
+    permissions_summary = serializers.SerializerMethodField()
+    accessible_stores_count = serializers.SerializerMethodField()
+    accessible_locations_count = serializers.SerializerMethodField()
+    accessible_standalone_count = serializers.SerializerMethodField()
+    is_main_store_incharge = serializers.SerializerMethodField()
+    can_issue_upward = serializers.SerializerMethodField()
+    parent_standalone_for_issuance = serializers.SerializerMethodField()
     
     class Meta:
         model = UserProfile
-        fields = '__all__'
+        fields = [
+            'id', 'user', 'role', 'role_display', 'assigned_locations', 'assigned_locations_data',
+            'created_by', 'created_by_name', 'phone', 'employee_id', 'department', 'department_name',
+            'custom_permissions', 'is_active', 'created_at', 'updated_at',
+            # Write-only user fields
+            'username', 'password', 'email', 'first_name', 'last_name',
+            # Enhanced fields
+            'responsible_location', 'allowed_assignment_locations', 'permissions_summary',
+            'accessible_stores_count', 'accessible_locations_count', 'accessible_standalone_count',
+            'is_main_store_incharge', 'can_issue_upward', 'parent_standalone_for_issuance'
+        ]
         read_only_fields = ['created_by', 'employee_id', 'created_at', 'updated_at']
+    
+    def get_user(self, obj):
+        """Get user data"""
+        return {
+            'id': obj.user.id,
+            'username': obj.user.username,
+            'email': obj.user.email,
+            'first_name': obj.user.first_name,
+            'last_name': obj.user.last_name,
+            'full_name': obj.user.get_full_name() or obj.user.username,
+            'is_active': obj.user.is_active
+        }
     
     def get_assigned_locations_data(self, obj):
         return LocationMinimalSerializer(obj.assigned_locations.all(), many=True).data
     
-    def get_can_create_users(self, obj):
-        return obj.role in [UserRole.SYSTEM_ADMIN, UserRole.LOCATION_HEAD]
-    
-    def get_can_create_locations(self, obj):
-        return obj.role in [UserRole.SYSTEM_ADMIN, UserRole.LOCATION_HEAD, UserRole.STOCK_INCHARGE]
-    
-    def get_main_location(self, obj):
-        main_loc = obj.get_main_location()
-        if main_loc:
-            return LocationMinimalSerializer(main_loc).data
+    def get_responsible_location(self, obj):
+        """Get the location this user is responsible for"""
+        responsible_loc = obj.get_responsible_location()
+        if responsible_loc:
+            return {
+                'id': responsible_loc.id,
+                'name': responsible_loc.name,
+                'type': responsible_loc.location_type,
+                'code': responsible_loc.code,
+                'is_store': responsible_loc.is_store,
+                'is_standalone': responsible_loc.is_standalone,
+                'is_main_store': responsible_loc.is_main_store if responsible_loc.is_store else False,
+                'parent_location': responsible_loc.parent_location_id
+            }
         return None
-
+    
+    def get_allowed_assignment_locations(self, obj):
+        """Get locations that can be assigned to this user based on their role"""
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return []
+        
+        current_user_profile = request.user.profile
+        
+        if obj.role == UserRole.LOCATION_HEAD:
+            # For Location Head, can assign standalone locations
+            accessible_locations = current_user_profile.get_accessible_locations()
+            assignable_locations = accessible_locations.filter(is_standalone=True).distinct()
+            return LocationMinimalSerializer(assignable_locations, many=True).data
+        
+        elif obj.role == UserRole.STOCK_INCHARGE:
+            # For Stock Incharge, can assign stores
+            accessible_stores = current_user_profile.get_accessible_stores()
+            return LocationMinimalSerializer(accessible_stores, many=True).data
+        
+        return []
+    
+    def get_permissions_summary(self, obj):
+        """Get comprehensive permissions summary"""
+        return obj.get_permissions_summary()
+    
+    def get_accessible_stores_count(self, obj):
+        return obj.get_accessible_stores().count()
+    
+    def get_accessible_locations_count(self, obj):
+        return obj.get_accessible_locations().count()
+    
+    def get_accessible_standalone_count(self, obj):
+        return obj.get_standalone_locations().count()
+    
+    def get_is_main_store_incharge(self, obj):
+        return obj.is_main_store_incharge()
+    
+    def get_can_issue_upward(self, obj):
+        return obj.can_issue_to_parent_standalone()
+    
+    def get_parent_standalone_for_issuance(self, obj):
+        parent = obj.get_parent_standalone_for_issuance()
+        if parent:
+            return {
+                'id': parent.id,
+                'name': parent.name,
+                'code': parent.code,
+                'is_standalone': parent.is_standalone
+            }
+        return None
+    
     def validate_assigned_locations(self, value):
-        """
-        Validate assigned locations based on user role being created
-        """
+        """Validate assigned locations based on user role"""
         request = self.context.get('request')
         current_user = request.user if request else None
         
@@ -83,21 +167,29 @@ class UserProfileSerializer(serializers.ModelSerializer):
         
         # For Location Head: only allow standalone locations
         if role == UserRole.LOCATION_HEAD:
+            non_standalone = []
             for location in value:
-                if not location.is_standalone():
-                    raise serializers.ValidationError(
-                        f"{location.name} is not a standalone location. "
-                        f"Location Heads can only be assigned to standalone locations (top-level locations with no parent)."
-                    )
+                if not location.is_standalone:
+                    non_standalone.append(f"{location.name} ({location.location_type})")
+            
+            if non_standalone:
+                raise serializers.ValidationError(
+                    f"Location Head can only be assigned to standalone locations. "
+                    f"The following are not standalone: {', '.join(non_standalone)}"
+                )
         
         # For Stock Incharge: only allow store locations
         elif role == UserRole.STOCK_INCHARGE:
+            non_store_locations = []
             for location in value:
                 if not location.is_store:
-                    raise serializers.ValidationError(
-                        f"{location.name} is not a store location. "
-                        f"Stock Incharge can only be assigned to store locations."
-                    )
+                    non_store_locations.append(f"{location.name} ({location.location_type})")
+            
+            if non_store_locations:
+                raise serializers.ValidationError(
+                    f"Stock Incharge can only be assigned to store locations. "
+                    f"The following are not stores: {', '.join(non_store_locations)}"
+                )
         
         # Additional validation for Location Head creating Stock Incharge
         if current_user and hasattr(current_user, 'profile'):
@@ -106,21 +198,37 @@ class UserProfileSerializer(serializers.ModelSerializer):
             if current_profile.role == UserRole.LOCATION_HEAD:
                 if role == UserRole.STOCK_INCHARGE:
                     # Validate each location is accessible to the Location Head
+                    inaccessible_locations = []
                     for location in value:
                         if not location.is_store:
-                            raise serializers.ValidationError({
-                                'assigned_locations': f"{location.name} is not a store location"
-                            })
-                        if not current_profile.has_location_access(location):
-                            raise serializers.ValidationError({
-                                'assigned_locations': f"You don't have access to {location.name}"
-                            })
+                            inaccessible_locations.append(f"{location.name} (not a store)")
+                        elif not current_profile.has_location_access(location):
+                            inaccessible_locations.append(f"{location.name} (no access)")
+                    
+                    if inaccessible_locations:
+                        raise serializers.ValidationError(
+                            f"You don't have access to assign these locations: {', '.join(inaccessible_locations)}"
+                        )
         
         return value
     
+    def validate_role(self, value):
+        """Validate role assignment"""
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            current_profile = request.user.profile
+            
+            # Check if current user can assign this role
+            if not current_profile.can_create_user(value):
+                raise serializers.ValidationError(
+                    f"You don't have permission to create users with role: {value}"
+                )
+        
+        return value
     
     @transaction.atomic
     def create(self, validated_data):
+        # Extract user creation data
         username = validated_data.pop('username', None)
         password = validated_data.pop('password', None)
         email = validated_data.pop('email', None)
@@ -131,6 +239,13 @@ class UserProfileSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         current_user = request.user if request else None
         
+        # Validate required fields
+        if not username:
+            raise serializers.ValidationError({'username': "Username is required"})
+        if not password:
+            raise serializers.ValidationError({'password': "Password is required"})
+        
+        # Validate permissions
         if current_user and hasattr(current_user, 'profile'):
             current_profile = current_user.profile
             target_role = validated_data.get('role')
@@ -140,44 +255,52 @@ class UserProfileSerializer(serializers.ModelSerializer):
                     'role': f"{current_profile.get_role_display()} cannot create {target_role} users"
                 })
             
+            # Location Head specific validations
             if current_profile.role == UserRole.LOCATION_HEAD:
                 if target_role != UserRole.STOCK_INCHARGE:
                     raise serializers.ValidationError({
                         'role': "Location Heads can only create Stock Incharge users"
                     })
                 
-                # Validate assigned locations for Stock Incharge
                 if not assigned_locations:
                     raise serializers.ValidationError({
                         'assigned_locations': "At least one store must be assigned to Stock Incharge"
                     })
         
-        if not username:
-            raise serializers.ValidationError({'username': "Username is required"})
-        if not password:
-            raise serializers.ValidationError({'password': "Password is required"})
-        
+        # Check if user already exists
         if User.objects.filter(username=username).exists():
-            raise serializers.ValidationError({'username': "Username already exists"})
+            raise serializers.ValidationError({
+                'username': f"User with username '{username}' already exists"
+            })
         
-        # Create Django User
-        user = User.objects.create_user(
-            username=username,
-            password=password,
-            email=email or f"{username}@inventory.local",
-            first_name=first_name or '',
-            last_name=last_name or ''
-        )
+        # Create new Django User
+        try:
+            user = User.objects.create_user(
+                username=username,
+                password=password,
+                email=email or f"{username}@inventory.local",
+                first_name=first_name or '',
+                last_name=last_name or ''
+            )
+        except Exception as e:
+            raise serializers.ValidationError({
+                'error': f"Failed to create user: {str(e)}"
+            })
         
-        # Create UserProfile
-        validated_data['user'] = user
-        validated_data['created_by'] = current_user
-        profile = UserProfile.objects.create(**validated_data)
+        # Get the profile that was created by the signal
+        profile = user.profile
         
-        # Assign locations to the profile
+        # Update the profile with the validated data
+        for field, value in validated_data.items():
+            if field != 'user':
+                setattr(profile, field, value)
+        
+        profile.created_by = current_user
+        profile.save()
+        
+        # Set the many-to-many relationship AFTER saving
         if assigned_locations:
             profile.assigned_locations.set(assigned_locations)
-            profile.save()
         
         # Log activity
         if current_user:
@@ -197,13 +320,16 @@ class UserProfileSerializer(serializers.ModelSerializer):
     
     @transaction.atomic
     def update(self, instance, validated_data):
+        # Remove user-related fields that we'll handle separately
         validated_data.pop('username', None)
         validated_data.pop('password', None)
         
         email = validated_data.pop('email', None)
         first_name = validated_data.pop('first_name', None)
         last_name = validated_data.pop('last_name', None)
+        assigned_locations = validated_data.pop('assigned_locations', None)
         
+        # Update user fields if provided
         if email:
             instance.user.email = email
         if first_name is not None:
@@ -212,12 +338,11 @@ class UserProfileSerializer(serializers.ModelSerializer):
             instance.user.last_name = last_name
         instance.user.save()
         
-        assigned_locations = validated_data.pop('assigned_locations', None)
-        
         request = self.context.get('request')
         if request and hasattr(request.user, 'profile'):
             current_profile = request.user.profile
             
+            # Permission checks for updates
             if current_profile.role == UserRole.LOCATION_HEAD:
                 if instance.created_by != request.user and instance.user != request.user:
                     raise serializers.ValidationError({
@@ -241,10 +366,9 @@ class UserProfileSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         
-        # CRITICAL FIX: Update assigned locations
+        # Update assigned locations AFTER saving the instance
         if assigned_locations is not None:
             instance.assigned_locations.set(assigned_locations)
-            instance.save()  # Save after setting locations
         
         # Log activity
         if request:
@@ -259,14 +383,18 @@ class UserProfileSerializer(serializers.ModelSerializer):
                 }
             )
         
-        return instance  # Changed from 'profile' to 'instance'
+        return instance
 
 
 # ==================== LOCATION SERIALIZERS ====================
 class LocationMinimalSerializer(serializers.ModelSerializer):
+    is_standalone = serializers.BooleanField(read_only=True)
+    is_main_store = serializers.BooleanField(read_only=True)
+    
     class Meta:
         model = Location
-        fields = ['id', 'name', 'code', 'location_type', 'is_store', 'is_auto_created', 'parent_location']
+        fields = ['id', 'name', 'code', 'location_type', 'is_store', 'is_auto_created', 
+                 'is_main_store', 'parent_location', 'is_standalone', 'is_root_location']
 
 
 class LocationSerializer(serializers.ModelSerializer):
@@ -278,24 +406,39 @@ class LocationSerializer(serializers.ModelSerializer):
     auto_created_store_data = serializers.SerializerMethodField()
     main_store = serializers.SerializerMethodField()
     depth = serializers.SerializerMethodField()
-    is_standalone = serializers.SerializerMethodField()
+    is_standalone = serializers.BooleanField()
+    same_hierarchy_locations = serializers.SerializerMethodField()
+    parent_standalone = serializers.SerializerMethodField()
+    
+    # Enhanced fields
+    can_have_sub_locations = serializers.SerializerMethodField()
+    allowed_location_types = serializers.SerializerMethodField()
+    can_be_assigned_to_location_head = serializers.SerializerMethodField()
+    can_issue_to_parent_standalone = serializers.SerializerMethodField()
+    parent_standalone_for_issuance = serializers.SerializerMethodField()
     
     class Meta:
         model = Location
         fields = '__all__'
-        read_only_fields = ['auto_created_store', 'is_auto_created', 'created_at', 'updated_at']
+        read_only_fields = ['hierarchy_level', 'hierarchy_path', 'auto_created_store', 
+                           'is_auto_created', 'created_at', 'updated_at', 'is_root_location']
     
     def get_full_path(self, obj):
         return obj.get_full_path()
     
     def get_total_items(self, obj):
-        return ItemInstance.objects.filter(current_location=obj).count()
+        if obj.is_store:
+            return ItemInstance.objects.filter(source_location=obj).count()
+        return 0
     
     def get_stores_count(self, obj):
+        if obj.is_store:
+            return 0
         return obj.get_all_stores().count()
     
     def get_all_stores(self, obj):
-        return LocationMinimalSerializer(obj.get_all_stores(), many=True).data
+        stores = obj.get_all_stores()
+        return LocationMinimalSerializer(stores, many=True).data
     
     def get_auto_created_store_data(self, obj):
         if obj.auto_created_store:
@@ -311,56 +454,121 @@ class LocationSerializer(serializers.ModelSerializer):
     def get_depth(self, obj):
         return obj.get_depth()
     
-    def get_is_standalone(self, obj):
-        return obj.is_standalone()
+    def get_same_hierarchy_locations(self, obj):
+        # For performance, return minimal data
+        root = obj.get_root_location()
+        if root:
+            return {'root_id': root.id, 'root_name': root.name}
+        return None
+    
+    def get_parent_standalone(self, obj):
+        parent_standalone = obj.get_parent_standalone()
+        if parent_standalone:
+            return {
+                'id': parent_standalone.id,
+                'name': parent_standalone.name,
+                'code': parent_standalone.code,
+                'is_standalone': parent_standalone.is_standalone
+            }
+        return None
+    
+    def get_can_have_sub_locations(self, obj):
+        return obj.can_have_sub_locations()
+    
+    def get_allowed_location_types(self, obj):
+        """Get allowed location types that can be created under this location"""
+        if not obj.can_have_sub_locations():
+            return []
+        
+        # Define hierarchy rules
+        type_hierarchy = {
+            'ROOT': [LocationType.DEPARTMENT, LocationType.BUILDING, LocationType.JUNKYARD, 
+                    LocationType.OFFICE, LocationType.OTHER],
+            'DEPARTMENT': [LocationType.STORE, LocationType.ROOM, LocationType.LAB, 
+                         LocationType.OFFICE, LocationType.AV_HALL, LocationType.AUDITORIUM],
+            'BUILDING': [LocationType.STORE, LocationType.ROOM, LocationType.LAB, 
+                        LocationType.OFFICE, LocationType.AV_HALL, LocationType.AUDITORIUM],
+            'OFFICE': [LocationType.STORE, LocationType.ROOM],
+            'OTHER': [LocationType.STORE, LocationType.ROOM, LocationType.LAB],
+        }
+        
+        parent_type = 'ROOT' if obj.is_root_location else obj.location_type
+        return type_hierarchy.get(parent_type, [LocationType.STORE, LocationType.ROOM])
+    
+    def get_can_be_assigned_to_location_head(self, obj):
+        """Check if this location can be assigned to a Location Head"""
+        return obj.is_standalone
+    
+    def get_can_issue_to_parent_standalone(self, obj):
+        """Check if this store can issue to parent standalone"""
+        return obj.can_issue_to_parent_standalone() if obj.is_store else False
+    
+    def get_parent_standalone_for_issuance(self, obj):
+        """Get the parent standalone this store can issue to"""
+        if obj.is_store:
+            parent = obj.get_parent_standalone_for_issuance()
+            if parent:
+                return {
+                    'id': parent.id,
+                    'name': parent.name,
+                    'code': parent.code
+                }
+        return None
     
     def validate(self, data):
         request = self.context.get('request')
         parent_location = data.get('parent_location')
+        location_type = data.get('location_type')
+        is_store = data.get('is_store', False)
+        is_standalone = data.get('is_standalone', False)
         
-        if data.get('is_store') and parent_location:
-            if parent_location.is_store:
+        if not request or not hasattr(request.user, 'profile'):
+            raise serializers.ValidationError("User authentication required")
+        
+        profile = request.user.profile
+        
+        # Check if user can create location
+        if not profile.can_create_location(parent_location):
+            raise serializers.ValidationError({
+                'parent_location': "You don't have permission to create locations under this parent"
+            })
+        
+        # Validate stores cannot be standalone
+        if is_store and is_standalone:
+            raise serializers.ValidationError({
+                'is_standalone': "Store locations cannot be marked as standalone"
+            })
+        
+        # Validate location type hierarchy
+        if parent_location:
+            serializer = LocationSerializer(parent_location, context=self.context)
+            allowed_types = serializer.get_allowed_location_types(parent_location)
+            if location_type not in allowed_types:
                 raise serializers.ValidationError({
-                    'parent_location': "Store locations cannot be parent locations"
+                    'location_type': f"Cannot create {location_type} under {parent_location.location_type}. "
+                                   f"Allowed types: {', '.join(allowed_types)}"
                 })
         
-        if request and hasattr(request.user, 'profile'):
-            profile = request.user.profile
+        # Validate root location rules
+        if not parent_location:
+            # Only SYSTEM_ADMIN can create root
+            if profile.role != UserRole.SYSTEM_ADMIN:
+                raise serializers.ValidationError({
+                    'parent_location': "Only System Admin can create root location"
+                })
             
-            if profile.role == UserRole.LOCATION_HEAD:
-                if parent_location and not profile.has_location_access(parent_location):
-                    raise serializers.ValidationError({
-                        'parent_location': "You don't have access to create sub-locations under this location"
-                    })
+            # Root must be standalone
+            if not is_standalone:
+                raise serializers.ValidationError({
+                    'is_standalone': "Root location must be marked as standalone"
+                })
             
-            elif profile.role == UserRole.STOCK_INCHARGE:
-                if not parent_location:
+            # Only one root allowed
+            if Location.objects.filter(parent_location__isnull=True).exists():
+                if not self.instance or self.instance.parent_location is not None:
                     raise serializers.ValidationError({
-                        'parent_location': "Stock Incharge must specify a parent location"
+                        'parent_location': "Only one root location is allowed"
                     })
-                
-                main_location = profile.get_main_location()
-                
-                if not main_location:
-                    raise serializers.ValidationError({
-                        'error': "Could not determine your main location"
-                    })
-                
-                if parent_location.id == main_location.id:
-                    pass
-                else:
-                    current = parent_location
-                    is_valid = False
-                    while current:
-                        if current.id == main_location.id:
-                            is_valid = True
-                            break
-                        current = current.parent_location
-                    
-                    if not is_valid:
-                        raise serializers.ValidationError({
-                            'parent_location': f"You can only create locations within '{main_location.name}' or its sub-locations"
-                        })
         
         return data
 
@@ -394,6 +602,7 @@ class ItemMinimalSerializer(serializers.ModelSerializer):
 class ItemSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source='category.name', read_only=True)
     default_location_name = serializers.CharField(source='default_location.name', read_only=True)
+    default_location_is_standalone = serializers.BooleanField(source='default_location.is_standalone', read_only=True)
     total_instances = serializers.SerializerMethodField()
     available_quantity = serializers.SerializerMethodField()
     
@@ -406,6 +615,14 @@ class ItemSerializer(serializers.ModelSerializer):
     
     def get_available_quantity(self, obj):
         return obj.instances.filter(current_status='IN_STORE').count()
+    
+    def validate_default_location(self, value):
+        """Validate that default_location is standalone"""
+        if not value.is_standalone:
+            raise serializers.ValidationError(
+                "Items must belong to a standalone location (Department, Main University, etc.)"
+            )
+        return value
 
 
 # ==================== INSPECTION SERIALIZERS ====================
@@ -441,6 +658,7 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
     inspection_items = InspectionItemSerializer(many=True, required=False)
     department_name = serializers.CharField(source='department.name', read_only=True)
     department_full_path = serializers.SerializerMethodField()
+    department_is_standalone = serializers.BooleanField(source='department.is_standalone', read_only=True)
     main_store = serializers.SerializerMethodField()
     main_store_name = serializers.SerializerMethodField()
     
@@ -457,8 +675,6 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
     stage_progress = serializers.SerializerMethodField()
     stage_display = serializers.CharField(source='get_stage_display', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    is_locked_for_location_head = serializers.SerializerMethodField()
-    is_locked_for_stock_incharge = serializers.SerializerMethodField()
     
     total_items_count = serializers.SerializerMethodField()
     total_accepted = serializers.SerializerMethodField()
@@ -487,22 +703,6 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
     def get_main_store_name(self, obj):
         main_store = obj.get_main_store()
         return main_store.name if main_store else None
-    
-    def get_is_locked_for_location_head(self, obj):
-        request = self.context.get('request')
-        if request and hasattr(request.user, 'profile'):
-            profile = request.user.profile
-            if profile.role == UserRole.LOCATION_HEAD:
-                return obj.stage != 'INITIATED'
-        return False
-    
-    def get_is_locked_for_stock_incharge(self, obj):
-        request = self.context.get('request')
-        if request and hasattr(request.user, 'profile'):
-            profile = request.user.profile
-            if profile.role == UserRole.STOCK_INCHARGE:
-                return obj.stage not in ['STOCK_DETAILS']
-        return False
     
     def get_can_edit(self, obj):
         request = self.context.get('request')
@@ -540,8 +740,6 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if not request or not hasattr(request.user, 'profile'):
             return []
-        
-        profile = request.user.profile
         
         if not obj.can_edit_stage(request.user):
             return []
@@ -595,6 +793,14 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
         )
         return float(total) if total else None
     
+    def validate_department(self, value):
+        """Validate that department is standalone"""
+        if not value.is_standalone:
+            raise serializers.ValidationError(
+                "Inspection certificates must be for standalone locations only (Departments, Main University, etc.)"
+            )
+        return value
+    
     @transaction.atomic
     def create(self, validated_data):
         request = self.context.get('request')
@@ -621,7 +827,10 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
                 action='CREATE_INSPECTION_CERTIFICATE',
                 model='InspectionCertificate',
                 object_id=inspection_cert.id,
-                details={'certificate_no': inspection_cert.certificate_no}
+                details={
+                    'certificate_no': inspection_cert.certificate_no,
+                    'department': inspection_cert.department.name
+                }
             )
         
         return inspection_cert
@@ -686,7 +895,8 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
                 )
         
         return instance
-    
+
+
 class InspectionCertificateMinimalSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
     contractor_name = serializers.CharField(read_only=True)
@@ -718,6 +928,7 @@ class ItemInstanceSerializer(serializers.ModelSerializer):
     
     # QR Code and Image
     qr_code_image = serializers.SerializerMethodField()
+    qr_info = serializers.SerializerMethodField()
     
     # Availability flags
     is_available = serializers.SerializerMethodField()
@@ -735,17 +946,19 @@ class ItemInstanceSerializer(serializers.ModelSerializer):
     class Meta:
         model = ItemInstance
         fields = '__all__'
-        read_only_fields = ['instance_code', 'qr_code_data', 'qr_generated', 
+        read_only_fields = ['instance_code', 'qr_code_data', 'qr_generated', 'qr_data_json',
                            'previous_status', 'status_changed_at', 'status_changed_by']
     
     def get_location_path(self, obj):
         return obj.current_location.get_full_path()
     
     def get_qr_code_image(self, obj):
-        """Return QR code image data if available"""
         if obj.qr_code_data:
             return obj.qr_code_data
         return None
+    
+    def get_qr_info(self, obj):
+        return obj.get_qr_info()
     
     def get_is_available(self, obj):
         return obj.is_available()
@@ -808,14 +1021,18 @@ class StockEntrySerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     
     # Enhanced fields
-    requires_acknowledgment = serializers.SerializerMethodField()
+    requires_acknowledgment = serializers.BooleanField(read_only=True)
+    is_cross_location = serializers.BooleanField(read_only=True)
+    is_upward_transfer = serializers.BooleanField(read_only=True)
     is_transfer = serializers.SerializerMethodField()
     instances_count = serializers.SerializerMethodField()
+    can_acknowledge = serializers.SerializerMethodField()
     
     class Meta:
         model = StockEntry
         fields = '__all__'
-        read_only_fields = ['entry_number', 'created_at', 'updated_at', 'created_by']
+        read_only_fields = ['entry_number', 'created_at', 'updated_at', 'created_by', 
+                           'requires_acknowledgment', 'is_cross_location', 'is_upward_transfer']
     
     def get_created_by_name(self, obj):
         return obj.created_by.get_full_name() if obj.created_by else None
@@ -828,12 +1045,6 @@ class StockEntrySerializer(serializers.ModelSerializer):
             return timezone.now().date() > obj.expected_return_date
         return False
     
-    def get_requires_acknowledgment(self, obj):
-        return (obj.entry_type == 'ISSUE' and 
-                obj.to_location and 
-                obj.to_location.is_store and 
-                obj.status == 'PENDING_ACK')
-    
     def get_is_transfer(self, obj):
         return (obj.entry_type == 'ISSUE' and 
                 obj.to_location and 
@@ -842,12 +1053,63 @@ class StockEntrySerializer(serializers.ModelSerializer):
     def get_instances_count(self, obj):
         return obj.instances.count()
     
+    def get_can_acknowledge(self, obj):
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return False
+        
+        if not obj.requires_acknowledgment or obj.status != 'PENDING_ACK':
+            return False
+        
+        profile = request.user.profile
+        
+        # User must have access to the destination location
+        if obj.to_location:
+            return profile.has_location_access(obj.to_location)
+        
+        return False
+    
     def validate(self, data):
         entry_type = data.get('entry_type')
         from_location = data.get('from_location')
         to_location = data.get('to_location')
         is_temporary = data.get('is_temporary', False)
         
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            profile = request.user.profile
+            
+            # Stock Incharge validation
+            if profile.role == UserRole.STOCK_INCHARGE:
+                accessible_stores = profile.get_accessible_stores()
+                
+                if entry_type == 'ISSUE':
+                    # Validate from_location is an accessible store
+                    if from_location and from_location not in accessible_stores:
+                        raise serializers.ValidationError({
+                            'from_location': 'You can only issue from stores you manage'
+                        })
+                    
+                    # Check if this is an upward transfer
+                    if from_location and to_location and from_location.is_main_store:
+                        parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
+                        if to_location == parent_standalone_for_issuance:
+                            # This is a valid upward transfer
+                            pass
+                        elif not profile.has_location_access(to_location):
+                            # Regular transfer - validate access
+                            raise serializers.ValidationError({
+                                'to_location': f'You can only issue to locations within your hierarchy or to parent standalone location'
+                            })
+                
+                elif entry_type == 'RECEIPT':
+                    # Validate to_location is an accessible store
+                    if to_location and to_location not in accessible_stores:
+                        raise serializers.ValidationError({
+                            'to_location': 'You can only receive to stores you manage'
+                        })
+        
+        # Existing validation
         if entry_type == 'RECEIPT':
             if not to_location:
                 raise serializers.ValidationError({'to_location': "Receipt must have a destination location"})
@@ -861,6 +1123,23 @@ class StockEntrySerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({'from_location': "Issue source must be a store location"})
             if not to_location:
                 raise serializers.ValidationError({'to_location': "Issue must have a destination location"})
+            
+            # Check transfer permissions
+            if from_location and to_location:
+                # Check if upward transfer
+                if from_location.is_main_store:
+                    parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
+                    if to_location == parent_standalone_for_issuance:
+                        # Valid upward transfer
+                        pass
+                    elif not from_location.can_transfer_to(to_location):
+                        raise serializers.ValidationError({
+                            'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
+                        })
+                elif not from_location.can_transfer_to(to_location):
+                    raise serializers.ValidationError({
+                        'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
+                    })
             
             if is_temporary:
                 if not data.get('expected_return_date'):
@@ -955,7 +1234,6 @@ class LocationInventorySerializer(serializers.ModelSerializer):
         return obj.available_quantity < obj.item.reorder_level
     
     def get_status_breakdown(self, obj):
-        """Get breakdown by status"""
         return {
             'in_store': obj.in_store_quantity,
             'in_transit': obj.in_transit_quantity,
@@ -969,7 +1247,6 @@ class LocationInventorySerializer(serializers.ModelSerializer):
         }
     
     def get_utilization_percentage(self, obj):
-        """Calculate utilization percentage"""
         if obj.total_quantity > 0:
             utilized = obj.total_quantity - obj.available_quantity
             return round((utilized / obj.total_quantity) * 100, 2)
@@ -983,4 +1260,3 @@ class UserActivitySerializer(serializers.ModelSerializer):
     class Meta:
         model = UserActivity
         fields = '__all__'
-
