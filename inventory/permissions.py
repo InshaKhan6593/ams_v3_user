@@ -1,4 +1,4 @@
-# permissions.py - ENHANCED VERSION
+# permissions.py - ENHANCED VERSION with Download Permission
 from rest_framework import permissions
 from user_management.models import UserRole
 
@@ -184,12 +184,7 @@ class CanManageItems(permissions.BasePermission):
         return False
 
 
-# permissions.py - FIXED InspectionCertificatePermission for 4-Stage Workflow
-# Replace the InspectionCertificatePermission class in permissions.py
-
-# permissions.py - CRITICAL FIX for 4-Stage Workflow
-# Replace the InspectionCertificatePermission class completely
-
+# permissions.py - CRITICAL FIX for 4-Stage Workflow with Download Permission
 class InspectionCertificatePermission(permissions.BasePermission):
     """
     Permission for inspection certificate operations with 4-STAGE workflow.
@@ -199,11 +194,6 @@ class InspectionCertificatePermission(permissions.BasePermission):
     Stage 2 (STOCK_DETAILS): Department Store Incharge fills stock register
     Stage 3 (CENTRAL_REGISTER): Central Store Incharge fills central register
     Stage 4 (AUDIT_REVIEW): Auditor completes
-    
-    3-STAGE WORKFLOW (Root Location):
-    Stage 1 (INITIATED): Location Head creates & adds items
-    Stage 2 (CENTRAL_REGISTER): Central Store Incharge fills central register
-    Stage 3 (AUDIT_REVIEW): Auditor completes
     """
     
     def has_permission(self, request, view):
@@ -221,7 +211,7 @@ class InspectionCertificatePermission(permissions.BasePermission):
             return True
         
         # All authenticated users with profiles can list/retrieve/dashboard/creation_options
-        if view.action in ['list', 'retrieve', 'dashboard_stats', 'creation_options']:
+        if view.action in ['list', 'retrieve', 'dashboard_stats', 'creation_options', 'download_pdf']:
             return True
         
         # Create action - only Location Head of standalone locations
@@ -273,7 +263,7 @@ class InspectionCertificatePermission(permissions.BasePermission):
         is_root_cert = obj.department.parent_location is None
         
         # For list and retrieve, check location access
-        if view.action in ['list', 'retrieve', 'dashboard_stats']:
+        if view.action in ['list', 'retrieve', 'dashboard_stats', 'download_pdf']:
             # Auditor can view all
             if profile.role == UserRole.AUDITOR:
                 return True
@@ -295,7 +285,7 @@ class InspectionCertificatePermission(permissions.BasePermission):
                 # Can view if they have dept store access OR they're central store (for CENTRAL_REGISTER/AUDIT_REVIEW stage)
                 if has_dept_store_access:
                     return True
-                if is_central_store and obj.stage in ['CENTRAL_REGISTER', 'AUDIT_REVIEW']:
+                if is_central_store and obj.stage in ['CENTRAL_REGISTER', 'AUDIT_REVIEW', 'COMPLETED']:
                     return True
                 
                 return False
@@ -406,7 +396,7 @@ class IsSystemAdminOrReadOnly(permissions.BasePermission):
 
 class CanManageStockEntry(permissions.BasePermission):
     """
-    Permission for managing stock entries with upward transfer support.
+    Permission for managing stock entries with upward transfer and return acknowledgment support.
     - SYSTEM_ADMIN: Full access
     - STOCK_INCHARGE: Can create/manage entries for their stores
     - Main Store Incharge: Can also issue upward to parent standalone
@@ -444,8 +434,16 @@ class CanManageStockEntry(permissions.BasePermission):
         if profile.role == UserRole.SYSTEM_ADMIN:
             return True
         
-        # For acknowledge actions
-        if view.action in ['acknowledge_receipt', 'acknowledge_return']:
+        # NEW: For acknowledge_return action
+        if view.action == 'acknowledge_return':
+            # User must have access to the destination location (to_location)
+            # This is the original sender receiving back the rejected items
+            if obj.entry_type == 'RETURN' and obj.to_location:
+                return profile.has_location_access(obj.to_location)
+            return False
+        
+        # For acknowledge_receipt action (original logic)
+        if view.action == 'acknowledge_receipt':
             # User must have access to the destination location (to_location)
             if obj.to_location:
                 return profile.has_location_access(obj.to_location)

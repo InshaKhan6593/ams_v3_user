@@ -15,6 +15,13 @@ from inventory.serializers import *
 from inventory.permissions import *
 from user_management.models import UserProfile, UserActivity, UserRole
 
+from django.http import HttpResponse
+import os
+from django.conf import settings
+
+# Import your generator
+from .generator import InspectionCertificateGenerator
+
 # ==================== CUSTOM JWT VIEW ====================
 class CustomTokenObtainPairView(TokenObtainPairView):
     def post(self, request, *args, **kwargs):
@@ -1141,6 +1148,161 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
             'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
         })
 
+    @action(detail=True, methods=['get'])
+    def download_pdf(self, request, pk=None):
+        """Download inspection certificate as PDF"""
+        try:
+            certificate = self.get_object()
+            print(f"Starting PDF generation for certificate: {certificate.certificate_no}")
+            
+            # Check if certificate is completed
+            if certificate.stage != 'COMPLETED':
+                return Response(
+                    {'error': 'Certificate must be completed to download PDF'}, 
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Prepare data for PDF generator in the exact format expected
+            certificate_data = {
+                'contract_no': certificate.contract_no or 'N/A',
+                'date': str(certificate.date) if certificate.date else '',
+                'contractor_name': certificate.contractor_name or 'N/A',
+                'contractor_address': certificate.contractor_address or 'N/A',
+                'indenter': certificate.indenter or 'N/A',
+                'indent_no': certificate.indent_no or 'N/A',
+                'consignee': certificate.consignee_name or 'N/A',
+                'department': certificate.department.name if certificate.department else 'N/A',
+                'date_of_delivery': str(certificate.date_of_delivery) if certificate.date_of_delivery else '',
+                'delivery_status': certificate.delivery_type or 'FULL',
+                'date_of_inspection': str(certificate.date_of_inspection) if certificate.date_of_inspection else '',
+                'stock_register_no': [],
+                'dead_stock_register_no': getattr(certificate, 'central_store_register_no', '') or '',
+            }
+            
+            # Prepare item data - CRITICAL: Match the generator's expected format
+            item_data = {
+                'descriptions': [],
+                'acct_unit': [],
+                't_quantity': [],
+                'r_quantity': [],
+                'a_quantity': []
+            }
+            
+            # Prepare rejected item data
+            rejected_item_data = {
+                'item_no': [],
+                'reasons': []
+            }
+            
+            # Process inspection items
+            inspection_items = certificate.inspection_items.all()
+            print(f"Processing {inspection_items.count()} inspection items")
+            
+            for index, item in enumerate(inspection_items, 1):
+                # Main item data - ensure all fields have values
+                description = f"{item.item.name}"
+                if hasattr(item.item, 'specifications') and item.item.specifications:
+                    description += f"\nSpecs: {item.item.specifications}"
+                if item.remarks:
+                    description += f"\nRemarks: {item.remarks}"
+                    
+                item_data['descriptions'].append(description)
+                item_data['acct_unit'].append(item.item.acct_unit or 'N/A')
+                item_data['t_quantity'].append(str(item.tendered_quantity or 0))
+                item_data['r_quantity'].append(str(item.rejected_quantity or 0))
+                item_data['a_quantity'].append(str(item.accepted_quantity or 0))
+                
+                # Stock register data
+                if hasattr(item, 'stock_register_no') and item.stock_register_no:
+                    certificate_data['stock_register_no'].append(item.stock_register_no)
+                
+                # Rejected items
+                if item.rejected_quantity and item.rejected_quantity > 0:
+                    rejected_item_data['item_no'].append(str(index))
+                    rejection_reason = getattr(item, 'rejection_reason', 'Not meeting specifications') or "Not meeting specifications"
+                    rejected_item_data['reasons'].append(rejection_reason)
+            
+            # Ensure all arrays have the same length
+            item_count = len(item_data['descriptions'])
+            for key in ['acct_unit', 't_quantity', 'r_quantity', 'a_quantity']:
+                while len(item_data[key]) < item_count:
+                    item_data[key].append('0' if key.endswith('quantity') else 'N/A')
+            
+            print(f"Data prepared - Items: {item_count}, Rejected: {len(rejected_item_data['item_no'])}")
+            
+            # Generate PDF
+            try:
+                # Import the generator
+                from .generator import InspectionCertificateGenerator
+                
+                # Initialize generator with proper parameters
+                generator = InspectionCertificateGenerator(
+                    data=certificate_data,
+                    item_data=item_data,
+                    rejected_item_data=rejected_item_data
+                )
+                
+                pdf_buffer = generator.get_pdf()
+                
+                # Verify PDF was generated
+                if not pdf_buffer:
+                    raise Exception("PDF buffer is None")
+                    
+                buffer_size = pdf_buffer.getbuffer().nbytes
+                if buffer_size == 0:
+                    raise Exception("Generated PDF is empty (0 bytes)")
+                
+                print(f"PDF generated successfully - Size: {buffer_size} bytes")
+                
+                # Create HTTP response
+                response = HttpResponse(
+                    pdf_buffer.getvalue(), 
+                    content_type='application/pdf'
+                )
+                filename = f"Inspection-Certificate-{certificate.certificate_no}.pdf"
+                response['Content-Disposition'] = f'attachment; filename="{filename}"'
+                response['Content-Length'] = buffer_size
+                
+                # Log the download activity
+                UserActivity.objects.create(
+                    user=request.user,
+                    action='DOWNLOAD_PDF',
+                    model='InspectionCertificate',
+                    object_id=certificate.id,
+                    details={
+                        'certificate_no': certificate.certificate_no,
+                        'filename': filename,
+                        'file_size': buffer_size,
+                        'items_count': item_count
+                    }
+                )
+                
+                print(f"PDF download response ready for {filename}")
+                return response
+                
+            except Exception as pdf_error:
+                print(f"PDF Generation Error: {str(pdf_error)}")
+                import traceback
+                print(f"Traceback: {traceback.format_exc()}")
+                return Response(
+                    {'error': f'PDF generation failed: {str(pdf_error)}'}, 
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            
+        except InspectionCertificate.DoesNotExist:
+            return Response(
+                {'error': 'Certificate not found'}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            print(f"Download PDF Error: {str(e)}")
+            import traceback
+            print(f"Traceback: {traceback.format_exc()}")
+            return Response(
+                {'error': f'Failed to download PDF: {str(e)}'}, 
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
 # ==================== STOCK ENTRY VIEWSET ====================
 class StockEntryViewSet(viewsets.ModelViewSet):
     queryset = StockEntry.objects.all()
@@ -1329,112 +1491,426 @@ class StockEntryViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     @transaction.atomic
     def acknowledge_receipt(self, request, pk=None):
-        """Acknowledge receipt of stock transfer (including upward transfers)"""
+        """
+        STEP 1: Receiver acknowledges transfer.
+        
+        - ACCEPTED: Create RECEIPT entry, transfer ownership, IN_STORE
+        - REJECTED: Create RETURN entry, keep in IN_TRANSIT, wait for sender acknowledgment
+        """
         stock_entry = self.get_object()
         
         if stock_entry.status != 'PENDING_ACK':
-            return Response({'error': 'Entry is not pending acknowledgment'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                'error': 'Entry is not pending acknowledgment'
+            }, status=status.HTTP_400_BAD_REQUEST)
         
         accepted_ids = request.data.get('accepted_instances', [])
         rejected_ids = request.data.get('rejected_instances', [])
+        rejection_reason = request.data.get('rejection_reason', 'Quality issues')
         
         if not accepted_ids and not rejected_ids:
-            return Response({'error': 'Must accept or reject at least one instance'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({
+                'error': 'Must accept or reject at least one instance'
+            }, status=status.HTTP_400_BAD_REQUEST)
         
-        # CRITICAL FIX: Create RECEIPT stock entry for accepted items
+        # ========== PROCESS ACCEPTED INSTANCES ==========
+        acceptance_receipt = None
+        accepted_instances_data = []
+        
         if accepted_ids:
             accepted_instances = ItemInstance.objects.filter(id__in=accepted_ids)
             
-            # Create RECEIPT entry
-            receipt_entry = StockEntry.objects.create(
+            # ✅ CREATE RECEIPT ENTRY FOR ACCEPTED
+            acceptance_receipt = StockEntry.objects.create(
                 entry_type='RECEIPT',
                 from_location=stock_entry.from_location,
                 to_location=stock_entry.to_location,
                 item=stock_entry.item,
                 quantity=len(accepted_ids),
-                purpose=f"Receipt from transfer {stock_entry.entry_number}",
-                remarks=f"Acknowledged by {request.user.get_full_name()}",
+                purpose=f"Acceptance from transfer {stock_entry.entry_number}",
+                remarks=f"✓ {len(accepted_ids)} instances ACCEPTED",
                 reference_entry=stock_entry,
                 status='COMPLETED',
                 created_by=request.user,
                 acknowledged_by=request.user,
                 acknowledged_at=timezone.now()
             )
-            receipt_entry.instances.set(accepted_instances)
+            acceptance_receipt.instances.set(accepted_instances)
             
-            # Transfer ownership to destination store
+            # Transfer ownership and mark IN_STORE
             for instance in accepted_instances:
+                old_source = instance.source_location
+                
                 instance.source_location = stock_entry.to_location  # Transfer ownership
                 instance.current_location = stock_entry.to_location
                 instance.current_status = InstanceStatus.IN_STORE
+                instance.status_changed_by = request.user
+                instance.status_changed_at = timezone.now()
                 instance.save()
                 
-                # Create movement record
+                instance.generate_qr_code()
+                instance.save()
+                
                 InstanceMovement.objects.create(
                     instance=instance,
-                    stock_entry=receipt_entry,
+                    stock_entry=acceptance_receipt,
                     from_location=stock_entry.from_location,
                     to_location=stock_entry.to_location,
                     previous_status=InstanceStatus.IN_TRANSIT,
                     new_status=InstanceStatus.IN_STORE,
-                    movement_type='UPWARD_TRANSFER' if stock_entry.is_upward_transfer else 'TRANSFER',
+                    movement_type='TRANSFER',
                     moved_by=request.user,
-                    remarks=f"Acknowledged receipt from {stock_entry.from_location.name}",
+                    remarks=f"✓ ACCEPTED - Ownership: {old_source.name} → {stock_entry.to_location.name}",
                     acknowledged=True,
                     acknowledged_by=request.user,
                     acknowledged_at=timezone.now()
                 )
+                
+                accepted_instances_data.append({
+                    'id': instance.id,
+                    'instance_code': instance.instance_code,
+                    'receipt_entry': acceptance_receipt.entry_number,
+                    'status': 'IN_STORE',
+                    'qr_code': instance.qr_code_data
+                })
+            
+            # Update inventory for receiver
+            if stock_entry.to_location.is_store:
+                inv, _ = LocationInventory.objects.get_or_create(
+                    location=stock_entry.to_location,
+                    item=stock_entry.item
+                )
+                inv.update_quantities()
         
-        # Process rejected: Create return ISSUE entry
+        # ========== PROCESS REJECTED INSTANCES ==========
+        # ✅ CREATE RETURN ENTRY (PENDING_ACK) - Waiting for sender acknowledgment
+        return_entry = None
+        rejected_instances_data = []
+        
         if rejected_ids:
             rejected_instances = ItemInstance.objects.filter(id__in=rejected_ids)
             
+            # ✅ CREATE RETURN ENTRY (NOT RECEIPT YET)
             return_entry = StockEntry.objects.create(
-                entry_type='ISSUE',
-                from_location=stock_entry.to_location,
-                to_location=stock_entry.from_location,
+                entry_type='RETURN',  # Type: RETURN
+                from_location=stock_entry.to_location,      # From receiver (Physics Lab)
+                to_location=stock_entry.from_location,      # To sender (CS Main Store)
                 item=stock_entry.item,
                 quantity=len(rejected_ids),
-                purpose=f"Rejected items from transfer {stock_entry.entry_number}",
-                remarks=f"Rejected by {request.user.get_full_name()}",
+                purpose=f"Return rejected items from transfer {stock_entry.entry_number}",
+                remarks=f"✗ {len(rejected_ids)} instances REJECTED. Reason: {rejection_reason}",
                 reference_entry=stock_entry,
-                status='PENDING_ACK',
+                status='PENDING_ACK',  # ⚠️ WAITING for sender to acknowledge
+                requires_acknowledgment=True,
                 created_by=request.user
             )
             return_entry.instances.set(rejected_instances)
             
-            # Keep rejected instances in transit back to sender
+            # Keep instances IN_TRANSIT (going back to sender)
             for instance in rejected_instances:
-                instance.current_status = InstanceStatus.IN_TRANSIT
-                instance.current_location = stock_entry.from_location  # Route back
+                instance.current_location = stock_entry.from_location  # Route back to sender
+                instance.current_status = InstanceStatus.IN_TRANSIT   # ⚠️ Still IN_TRANSIT
+                instance.previous_status = InstanceStatus.IN_TRANSIT
+                instance.status_changed_by = request.user
+                instance.status_changed_at = timezone.now()
+                instance.condition_notes = f"REJECTED by {stock_entry.to_location.name}: {rejection_reason}"
+                # source_location UNCHANGED (still owned by sender)
                 instance.save()
+                
+                instance.generate_qr_code()
+                instance.save()
+                
+                InstanceMovement.objects.create(
+                    instance=instance,
+                    stock_entry=return_entry,
+                    from_location=stock_entry.to_location,
+                    to_location=stock_entry.from_location,
+                    previous_status=InstanceStatus.IN_TRANSIT,
+                    new_status=InstanceStatus.IN_TRANSIT,
+                    movement_type='RETURN',
+                    moved_by=request.user,
+                    remarks=f"✗ REJECTED: {rejection_reason}. Returning to {stock_entry.from_location.name} (awaiting sender acknowledgment)",
+                    acknowledged=False,  # Not acknowledged yet
+                    requires_acknowledgment=True
+                )
+                
+                rejected_instances_data.append({
+                    'id': instance.id,
+                    'instance_code': instance.instance_code,
+                    'return_entry': return_entry.entry_number,
+                    'status': 'IN_TRANSIT',
+                    'awaiting_sender_acknowledgment': True,
+                    'rejection_reason': rejection_reason,
+                    'qr_code': instance.qr_code_data
+                })
         
-        # Mark original transfer as completed
+        # Complete original transfer
         stock_entry.status = 'COMPLETED'
         stock_entry.acknowledged_by = request.user
         stock_entry.acknowledged_at = timezone.now()
         stock_entry.save()
         
-        # Update inventories for both locations
-        self._update_inventories(stock_entry)
-        if accepted_ids:
-            # Update inventory for the receipt entry too
-            inv, _ = LocationInventory.objects.get_or_create(
-                location=stock_entry.to_location,
-                item=stock_entry.item
+        return Response({
+            'success': True,
+            'message': 'Acknowledgment processed',
+            'accepted': {
+                'count': len(accepted_ids),
+                'receipt_entry': acceptance_receipt.entry_number if acceptance_receipt else None,
+                'status': 'COMPLETED - Items IN_STORE at receiver',
+                'instances': accepted_instances_data
+            },
+            'rejected': {
+                'count': len(rejected_ids),
+                'return_entry': return_entry.entry_number if return_entry else None,
+                'status': 'PENDING - Items IN_TRANSIT back to sender',
+                'awaiting_sender_acknowledgment': True,
+                'instances': rejected_instances_data,
+                'next_step': f'Sender ({stock_entry.from_location.name}) must acknowledge return'
+            }
+        })
+
+
+    # ==================== STEP 2: SENDER ACKNOWLEDGES RETURN ====================
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def acknowledge_return(self, request, pk=None):
+        """
+        STEP 2: Sender acknowledges receipt of RETURNED/REJECTED items.
+        
+        - Creates RECEIPT entry
+        - Marks instances as IN_STORE
+        - Updates inventory
+        
+        This is called by the ORIGINAL SENDER when rejected items come back.
+        """
+        return_entry = self.get_object()
+        
+        # Validate this is a RETURN entry
+        if return_entry.entry_type != 'RETURN':
+            return Response({
+                'error': 'This endpoint is only for RETURN entries',
+                'entry_type': return_entry.entry_type
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        if return_entry.status != 'PENDING_ACK':
+            return Response({
+                'error': 'Return is not pending acknowledgment',
+                'current_status': return_entry.status
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Get instances to acknowledge
+        acknowledged_ids = request.data.get('accepted_instances', [])
+        
+        if not acknowledged_ids:
+            # If no specific IDs, acknowledge all
+            acknowledged_ids = list(return_entry.instances.values_list('id', flat=True))
+        
+        if not acknowledged_ids:
+            return Response({
+                'error': 'No instances to acknowledge'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        acknowledged_instances = ItemInstance.objects.filter(id__in=acknowledged_ids)
+        
+        # ✅ CREATE RECEIPT ENTRY (Finally!)
+        receipt_entry = StockEntry.objects.create(
+            entry_type='RECEIPT',  # Now it's a RECEIPT
+            from_location=return_entry.from_location,  # From receiver who rejected
+            to_location=return_entry.to_location,      # To original sender
+            item=return_entry.item,
+            quantity=len(acknowledged_ids),
+            purpose=f"Receipt of returned items from return {return_entry.entry_number}",
+            remarks=f"✓ {len(acknowledged_ids)} rejected items received back by {request.user.get_full_name()}. Original rejection: {return_entry.remarks}",
+            reference_entry=return_entry,
+            status='COMPLETED',
+            created_by=request.user,
+            acknowledged_by=request.user,
+            acknowledged_at=timezone.now()
+        )
+        receipt_entry.instances.set(acknowledged_instances)
+        
+        # Process each instance
+        acknowledged_instances_data = []
+        for instance in acknowledged_instances:
+            # Mark as IN_STORE at sender location
+            instance.current_location = return_entry.to_location
+            instance.current_status = InstanceStatus.IN_STORE  # ✅ Finally IN_STORE
+            instance.previous_status = InstanceStatus.IN_TRANSIT
+            instance.status_changed_by = request.user
+            instance.status_changed_at = timezone.now()
+            # source_location stays UNCHANGED (was always owned by sender)
+            instance.save()
+            
+            # Regenerate QR code
+            instance.generate_qr_code()
+            instance.save()
+            
+            # Create movement record
+            InstanceMovement.objects.create(
+                instance=instance,
+                stock_entry=receipt_entry,  # Link to RECEIPT entry
+                from_location=return_entry.from_location,
+                to_location=return_entry.to_location,
+                previous_status=InstanceStatus.IN_TRANSIT,
+                new_status=InstanceStatus.IN_STORE,
+                movement_type='RETURN',
+                moved_by=request.user,
+                remarks=f"✓ RETURN ACKNOWLEDGED - Rejected item received back at {return_entry.to_location.name}. Receipt: {receipt_entry.entry_number}",
+                acknowledged=True,
+                acknowledged_by=request.user,
+                acknowledged_at=timezone.now()
+            )
+            
+            acknowledged_instances_data.append({
+                'id': instance.id,
+                'instance_code': instance.instance_code,
+                'receipt_entry': receipt_entry.entry_number,
+                'status': 'IN_STORE',
+                'location': return_entry.to_location.name,
+                'qr_code': instance.qr_code_data
+            })
+            
+            # Log activity
+            UserActivity.objects.create(
+                user=request.user,
+                action='ACKNOWLEDGE_TRANSFER',
+                model='ItemInstance',
+                object_id=instance.id,
+                details={
+                    'instance_code': instance.instance_code,
+                    'action': 'RETURN_ACKNOWLEDGED',
+                    'receipt_entry': receipt_entry.entry_number,
+                    'location': return_entry.to_location.name,
+                    'original_rejection': return_entry.remarks
+                }
+            )
+        
+        # Mark return entry as COMPLETED
+        return_entry.status = 'COMPLETED'
+        return_entry.acknowledged_by = request.user
+        return_entry.acknowledged_at = timezone.now()
+        return_entry.save()
+        
+        # ✅ UPDATE INVENTORY for sender
+        if return_entry.to_location.is_store:
+            inv, created = LocationInventory.objects.get_or_create(
+                location=return_entry.to_location,
+                item=return_entry.item
             )
             inv.update_quantities()
-        
-        message = f'Receipt acknowledged successfully. Accepted: {len(accepted_ids)}'
-        if rejected_ids:
-            message += f', Rejected: {len(rejected_ids)} (returning to sender)'
+            
+            # Log inventory update
+            UserActivity.objects.create(
+                user=request.user,
+                action='STOCK_ENTRY',
+                model='LocationInventory',
+                object_id=inv.id,
+                details={
+                    'location': return_entry.to_location.name,
+                    'item': return_entry.item.name,
+                    'quantity_change': f'+{len(acknowledged_ids)}',
+                    'reason': 'Rejected items returned and acknowledged',
+                    'receipt_entry': receipt_entry.entry_number,
+                    'return_entry': return_entry.entry_number
+                }
+            )
         
         return Response({
-            'message': message,
-            'accepted_count': len(accepted_ids),
-            'rejected_count': len(rejected_ids),
-            'receipt_entry_created': accepted_ids and True,
-            'return_entry_created': rejected_ids and True
+            'success': True,
+            'message': 'Return acknowledged successfully',
+            'return_entry': return_entry.entry_number,
+            'receipt_entry': receipt_entry.entry_number,
+            'instances_acknowledged': len(acknowledged_ids),
+            'location': return_entry.to_location.name,
+            'instances': acknowledged_instances_data,
+            'inventory_updated': True,
+            'summary': {
+                'status': 'COMPLETED',
+                'instances_now_in_store': len(acknowledged_ids),
+                'available_for_reuse': True
+            }
+        })
+
+
+    # ==================== HELPER ENDPOINTS ====================
+
+    @action(detail=False, methods=['get'])
+    def pending_returns(self, request):
+        """
+        Get all RETURN entries pending acknowledgment by sender.
+        Shows rejected items waiting to be acknowledged.
+        """
+        if not hasattr(request.user, 'profile'):
+            return Response({'error': 'Profile not found'}, status=404)
+        
+        profile = request.user.profile
+        
+        # Get stores user manages (sender stores)
+        accessible_stores = profile.get_accessible_stores()
+        
+        # Get RETURN entries TO these stores (rejected items coming back)
+        pending_returns = StockEntry.objects.filter(
+            entry_type='RETURN',
+            status='PENDING_ACK',
+            to_location__in=accessible_stores  # Returns TO sender
+        ).select_related(
+            'item', 'from_location', 'to_location', 'created_by', 'reference_entry'
+        ).prefetch_related('instances')
+        
+        returns_data = []
+        for return_entry in pending_returns:
+            instances = return_entry.instances.all()
+            
+            # Get original transfer details
+            original_transfer = return_entry.reference_entry
+            
+            return_data = {
+                'id': return_entry.id,
+                'return_entry_number': return_entry.entry_number,
+                'entry_date': return_entry.entry_date,
+                'from_location': {
+                    'id': return_entry.from_location.id,
+                    'name': return_entry.from_location.name,
+                    'code': return_entry.from_location.code
+                },
+                'to_location': {
+                    'id': return_entry.to_location.id,
+                    'name': return_entry.to_location.name,
+                    'code': return_entry.to_location.code
+                },
+                'item': {
+                    'id': return_entry.item.id,
+                    'name': return_entry.item.name,
+                    'code': return_entry.item.code
+                },
+                'quantity': return_entry.quantity,
+                'rejection_reason': return_entry.remarks,
+                'original_transfer': original_transfer.entry_number if original_transfer else None,
+                'rejected_by': return_entry.created_by.get_full_name() if return_entry.created_by else None,
+                'instances': [
+                    {
+                        'id': inst.id,
+                        'instance_code': inst.instance_code,
+                        'current_status': inst.current_status,
+                        'condition': inst.condition,
+                        'condition_notes': inst.condition_notes,
+                        'qr_code': inst.qr_code_data
+                    }
+                    for inst in instances
+                ],
+                'awaiting_acknowledgment_since': return_entry.created_at,
+                'days_pending': (timezone.now() - return_entry.created_at).days,
+                'action_required': f'Acknowledge receipt at {return_entry.to_location.name}'
+            }
+            returns_data.append(return_data)
+        
+        return Response({
+            'user_role': profile.role,
+            'stores': LocationMinimalSerializer(accessible_stores, many=True).data,
+            'pending_returns_count': len(returns_data),
+            'pending_returns': returns_data,
+            'instructions': 'Use acknowledge_return endpoint to confirm receipt of returned items'
         })
 
 # ==================== ITEM INSTANCE VIEWSET ====================
@@ -1468,6 +1944,7 @@ class ItemInstanceViewSet(viewsets.ModelViewSet):
         status_filter = self.request.query_params.get('status')
         search = self.request.query_params.get('search')
         source_location = self.request.query_params.get('source_location')
+        instance_code = self.request.query_params.get('instance_code')
         
         if location:
             queryset = queryset.filter(current_location_id=location)
@@ -1477,6 +1954,8 @@ class ItemInstanceViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(item_id=item)
         if status_filter:
             queryset = queryset.filter(current_status=status_filter)
+        if instance_code:
+            queryset = queryset.filter(instance_code__icontains=instance_code)
         if search:
             queryset = queryset.filter(
                 Q(instance_code__icontains=search) |
@@ -1485,6 +1964,346 @@ class ItemInstanceViewSet(viewsets.ModelViewSet):
             )
         
         return queryset.select_related('item', 'current_location', 'source_location')
+    
+    @action(detail=True, methods=['get'])
+    def scan_qr(self, request, pk=None):
+        """
+        Scan individual instance QR code and get comprehensive real-time information.
+        This is the PRIMARY endpoint for QR code scanning.
+        """
+        instance = self.get_object()
+        
+        # Get complete movement history
+        movements = InstanceMovement.objects.filter(
+            instance=instance
+        ).select_related(
+            'from_location', 'to_location', 'moved_by', 'acknowledged_by', 'stock_entry'
+        ).order_by('-moved_at')
+        
+        movements_data = []
+        for movement in movements:
+            movements_data.append({
+                'id': movement.id,
+                'date': movement.moved_at,
+                'from_location': {
+                    'id': movement.from_location.id if movement.from_location else None,
+                    'name': movement.from_location.name if movement.from_location else None,
+                    'type': movement.from_location.location_type if movement.from_location else None
+                },
+                'to_location': {
+                    'id': movement.to_location.id if movement.to_location else None,
+                    'name': movement.to_location.name if movement.to_location else None,
+                    'type': movement.to_location.location_type if movement.to_location else None
+                },
+                'previous_status': movement.previous_status,
+                'previous_status_display': movement.get_previous_status_display(),
+                'new_status': movement.new_status,
+                'new_status_display': movement.get_new_status_display(),
+                'movement_type': movement.movement_type,
+                'movement_type_display': movement.get_movement_type_display(),
+                'moved_by': movement.moved_by.get_full_name() if movement.moved_by else 'System',
+                'remarks': movement.remarks,
+                'acknowledged': movement.acknowledged,
+                'acknowledged_by': movement.acknowledged_by.get_full_name() if movement.acknowledged_by else None,
+                'acknowledged_at': movement.acknowledged_at,
+                'is_upward_transfer': movement.is_upward_transfer,
+                'stock_entry_number': movement.stock_entry.entry_number if movement.stock_entry else None
+            })
+        
+        # Check for pending transfers
+        pending_transfer = None
+        if instance.current_status == InstanceStatus.IN_TRANSIT:
+            pending = StockEntry.objects.filter(
+                instances=instance,
+                status='PENDING_ACK'
+            ).select_related('from_location', 'to_location', 'item', 'created_by').first()
+            
+            if pending:
+                pending_transfer = {
+                    'id': pending.id,
+                    'entry_number': pending.entry_number,
+                    'entry_type': pending.entry_type,
+                    'from_location': {
+                        'id': pending.from_location.id,
+                        'name': pending.from_location.name,
+                        'code': pending.from_location.code
+                    },
+                    'to_location': {
+                        'id': pending.to_location.id,
+                        'name': pending.to_location.name,
+                        'code': pending.to_location.code
+                    },
+                    'created_by': pending.created_by.get_full_name() if pending.created_by else None,
+                    'created_at': pending.created_at,
+                    'days_pending': (timezone.now() - pending.created_at).days,
+                    'is_upward_transfer': pending.is_upward_transfer,
+                    'awaiting_acknowledgment': True
+                }
+        
+        # Get lifecycle summary
+        lifecycle = {
+            'created': {
+                'date': instance.created_at,
+                'by': instance.created_by.get_full_name() if instance.created_by else None,
+                'location': instance.source_location.name,
+                'inspection_certificate': instance.inspection_certificate.certificate_no if instance.inspection_certificate else None
+            },
+            'current': {
+                'status': instance.current_status,
+                'status_display': instance.get_current_status_display(),
+                'location': instance.current_location.name,
+                'location_full_path': instance.current_location.get_full_path(),
+                'owner': instance.source_location.name,
+                'condition': instance.condition,
+                'condition_display': instance.get_condition_display(),
+                'last_updated': instance.updated_at
+            },
+            'statistics': {
+                'total_movements': movements.count(),
+                'days_since_creation': (timezone.now().date() - instance.created_at.date()).days,
+                'is_available': instance.is_available(),
+                'is_in_transit': instance.is_in_transit(),
+                'is_issued': instance.is_issued(),
+                'is_overdue': instance.is_overdue()
+            }
+        }
+        
+        # Assignment details if applicable
+        assignment = None
+        if instance.assigned_to:
+            assignment = {
+                'assigned_to': instance.assigned_to,
+                'assigned_date': instance.assigned_date,
+                'expected_return_date': instance.expected_return_date,
+                'actual_return_date': instance.actual_return_date,
+                'is_overdue': instance.is_overdue(),
+                'days_since_assigned': (timezone.now().date() - instance.assigned_date.date()).days if instance.assigned_date else None
+            }
+        
+        # Damage/Repair history if applicable
+        maintenance = None
+        if instance.current_status in [InstanceStatus.DAMAGED, InstanceStatus.UNDER_REPAIR]:
+            maintenance = {
+                'damage_reported_date': instance.damage_reported_date,
+                'damage_description': instance.damage_description,
+                'repair_started_date': instance.repair_started_date,
+                'repair_completed_date': instance.repair_completed_date,
+                'repair_cost': float(instance.repair_cost) if instance.repair_cost else None,
+                'repair_vendor': instance.repair_vendor
+            }
+        
+        return Response({
+            'instance': {
+                'id': instance.id,
+                'instance_code': instance.instance_code,
+                'item': {
+                    'id': instance.item.id,
+                    'name': instance.item.name,
+                    'code': instance.item.code,
+                    'category': instance.item.category.name if instance.item.category else None,
+                    'specifications': instance.item.specifications
+                },
+                'qr_code_image': instance.qr_code_data,
+                'qr_info': instance.get_qr_info(),
+                'qr_generated': instance.qr_generated
+            },
+            'lifecycle': lifecycle,
+            'pending_transfer': pending_transfer,
+            'assignment': assignment,
+            'maintenance': maintenance,
+            'movement_history': movements_data,
+            'scan_time': timezone.now()
+        })
+    
+    @action(detail=True, methods=['post'])
+    def regenerate_qr(self, request, pk=None):
+        """
+        Manually regenerate QR code for an instance.
+        Useful when data is updated.
+        """
+        instance = self.get_object()
+        
+        # Regenerate QR code with latest data
+        instance.generate_qr_code()
+        instance.save()
+        
+        # Log activity
+        UserActivity.objects.create(
+            user=request.user,
+            action='GENERATE_QR_CODE',
+            model='ItemInstance',
+            object_id=instance.id,
+            details={
+                'instance_code': instance.instance_code,
+                'current_status': instance.current_status,
+                'current_location': instance.current_location.name,
+                'regenerated_at': timezone.now().isoformat()
+            }
+        )
+        
+        return Response({
+            'message': 'QR code regenerated successfully',
+            'instance_code': instance.instance_code,
+            'qr_code_image': instance.qr_code_data,
+            'qr_info': instance.get_qr_info(),
+            'updated_at': instance.updated_at
+        })
+    
+    @action(detail=False, methods=['post'])
+    def scan_by_code(self, request):
+        """
+        Scan instance by QR code string or instance code.
+        For mobile scanning apps.
+        """
+        code = request.data.get('code') or request.data.get('instance_code')
+        
+        if not code:
+            return Response({
+                'error': 'Code parameter required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Try to find instance by code
+        try:
+            instance = ItemInstance.objects.get(instance_code=code)
+            
+            # Use the scan_qr method to get full details
+            request_with_pk = type('obj', (object,), {'user': request.user})
+            self.kwargs = {'pk': instance.pk}
+            
+            return self.scan_qr(request, pk=instance.pk)
+            
+        except ItemInstance.DoesNotExist:
+            return Response({
+                'error': f'No instance found with code: {code}',
+                'suggestions': 'Please check the code and try again'
+            }, status=status.HTTP_404_NOT_FOUND)
+    
+    @action(detail=False, methods=['get'])
+    def available_instances(self, request):
+        """
+        Get all available instances (IN_STORE status) for a location.
+        Used when creating transfers.
+        """
+        location_id = request.query_params.get('location')
+        item_id = request.query_params.get('item')
+        
+        if not location_id:
+            return Response({
+                'error': 'location parameter required'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        queryset = self.get_queryset().filter(
+            current_location_id=location_id,
+            current_status=InstanceStatus.IN_STORE
+        )
+        
+        if item_id:
+            queryset = queryset.filter(item_id=item_id)
+        
+        instances_data = []
+        for instance in queryset:
+            instances_data.append({
+                'id': instance.id,
+                'instance_code': instance.instance_code,
+                'item': {
+                    'id': instance.item.id,
+                    'name': instance.item.name,
+                    'code': instance.item.code
+                },
+                'condition': instance.condition,
+                'condition_display': instance.get_condition_display(),
+                'purchase_date': instance.purchase_date,
+                'warranty_expiry': instance.warranty_expiry,
+                'qr_code': instance.qr_code_data,
+                'source_location': instance.source_location.name
+            })
+        
+        return Response({
+            'location_id': location_id,
+            'item_id': item_id,
+            'available_count': len(instances_data),
+            'instances': instances_data
+        })
+    
+    @action(detail=False, methods=['get'])
+    def in_transit_instances(self, request):
+        """
+        Get all instances currently in transit.
+        Shows pending transfers.
+        """
+        if not hasattr(request.user, 'profile'):
+            return Response({'error': 'Profile not found'}, status=404)
+        
+        profile = request.user.profile
+        accessible_locations = profile.get_accessible_locations()
+        
+        # Get instances in transit related to user's locations
+        in_transit = self.get_queryset().filter(
+            current_status=InstanceStatus.IN_TRANSIT
+        ).filter(
+            Q(source_location__in=accessible_locations) |
+            Q(current_location__in=accessible_locations)
+        ).distinct()
+        
+        instances_data = []
+        for instance in in_transit:
+            # Find pending transfer
+            pending_transfer = StockEntry.objects.filter(
+                instances=instance,
+                status='PENDING_ACK'
+            ).select_related('from_location', 'to_location').first()
+            
+            instances_data.append({
+                'id': instance.id,
+                'instance_code': instance.instance_code,
+                'item': {
+                    'id': instance.item.id,
+                    'name': instance.item.name,
+                    'code': instance.item.code
+                },
+                'from_location': pending_transfer.from_location.name if pending_transfer else None,
+                'to_location': pending_transfer.to_location.name if pending_transfer else None,
+                'transfer_entry': pending_transfer.entry_number if pending_transfer else None,
+                'days_in_transit': (timezone.now() - instance.status_changed_at).days if instance.status_changed_at else None,
+                'qr_code': instance.qr_code_data
+            })
+        
+        return Response({
+            'in_transit_count': len(instances_data),
+            'instances': instances_data
+        })
+    
+    @action(detail=True, methods=['get'])
+    def print_qr_label(self, request, pk=None):
+        """
+        Get QR code with printable label format.
+        Includes instance details for physical labels.
+        """
+        instance = self.get_object()
+        
+        label_data = {
+            'qr_code_image': instance.qr_code_data,
+            'instance_code': instance.instance_code,
+            'item_name': instance.item.name,
+            'item_code': instance.item.code,
+            'category': instance.item.category.name if instance.item.category else None,
+            'current_location': instance.current_location.name,
+            'owner': instance.source_location.name,
+            'condition': instance.get_condition_display(),
+            'status': instance.get_current_status_display(),
+            'purchase_date': instance.purchase_date,
+            'warranty_expiry': instance.warranty_expiry,
+            'created_at': instance.created_at,
+            'label_format': {
+                'width': '4 inches',
+                'height': '2 inches',
+                'qr_size': '1.5 inches',
+                'font_size': '10pt'
+            }
+        }
+        
+        return Response(label_data)
+
 
 # ==================== LOCATION INVENTORY VIEWSET ====================
 class LocationInventoryViewSet(viewsets.ReadOnlyModelViewSet):

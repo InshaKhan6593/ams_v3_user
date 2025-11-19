@@ -1539,6 +1539,18 @@ class InstanceMovementSerializer(serializers.ModelSerializer):
 
 
 # ==================== STOCK ENTRY SERIALIZERS ====================
+# serializers.py - FIXED VERSION with Return Acknowledgment Support
+# This file includes proper serialization for the new acknowledge_return endpoint
+
+from rest_framework import serializers
+from django.utils import timezone
+from django.contrib.auth.models import User
+from inventory.models import *
+from user_management.models import UserProfile, UserRole, UserActivity
+import json
+from django.db import transaction
+
+# ==================== STOCK ENTRY SERIALIZERS ====================
 class StockEntrySerializer(serializers.ModelSerializer):
     instances_details = ItemInstanceSerializer(source='instances', many=True, read_only=True)
     instances = serializers.PrimaryKeyRelatedField(
@@ -1562,6 +1574,11 @@ class StockEntrySerializer(serializers.ModelSerializer):
     is_transfer = serializers.SerializerMethodField()
     instances_count = serializers.SerializerMethodField()
     can_acknowledge = serializers.SerializerMethodField()
+    
+    # NEW: Return acknowledgment fields
+    is_return_entry = serializers.SerializerMethodField()
+    can_acknowledge_return = serializers.SerializerMethodField()
+    original_transfer_info = serializers.SerializerMethodField()
     
     class Meta:
         model = StockEntry
@@ -1589,11 +1606,16 @@ class StockEntrySerializer(serializers.ModelSerializer):
         return obj.instances.count()
     
     def get_can_acknowledge(self, obj):
+        """Check if user can acknowledge receipt (for ISSUE transfers)"""
         request = self.context.get('request')
         if not request or not hasattr(request.user, 'profile'):
             return False
         
         if not obj.requires_acknowledgment or obj.status != 'PENDING_ACK':
+            return False
+        
+        # Only for ISSUE type entries
+        if obj.entry_type != 'ISSUE':
             return False
         
         profile = request.user.profile
@@ -1604,107 +1626,145 @@ class StockEntrySerializer(serializers.ModelSerializer):
         
         return False
     
+    def get_is_return_entry(self, obj):
+        """Check if this is a RETURN entry"""
+        return obj.entry_type == 'RETURN'
+    
+    def get_can_acknowledge_return(self, obj):
+        """Check if user can acknowledge return (for RETURN entries)"""
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return False
+        
+        # Only for RETURN entries
+        if obj.entry_type != 'RETURN':
+            return False
+        
+        if obj.status != 'PENDING_ACK':
+            return False
+        
+        profile = request.user.profile
+        
+        # User must have access to the destination location (original sender)
+        if obj.to_location:
+            return profile.has_location_access(obj.to_location)
+        
+        return False
+    
+    def get_original_transfer_info(self, obj):
+        """Get information about the original transfer (for RETURN entries)"""
+        if obj.entry_type == 'RETURN' and obj.reference_entry:
+            return {
+                'entry_number': obj.reference_entry.entry_number,
+                'entry_type': obj.reference_entry.entry_type,
+                'from_location': obj.reference_entry.from_location.name if obj.reference_entry.from_location else None,
+                'to_location': obj.reference_entry.to_location.name if obj.reference_entry.to_location else None,
+                'created_at': obj.reference_entry.created_at,
+                'created_by': obj.reference_entry.created_by.get_full_name() if obj.reference_entry.created_by else None
+            }
+        return None
+    
     def validate(self, data):
-            entry_type = data.get('entry_type')
-            from_location = data.get('from_location')
-            to_location = data.get('to_location')
-            is_temporary = data.get('is_temporary', False)
+        entry_type = data.get('entry_type')
+        from_location = data.get('from_location')
+        to_location = data.get('to_location')
+        is_temporary = data.get('is_temporary', False)
+        
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            profile = request.user.profile
             
-            request = self.context.get('request')
-            if request and hasattr(request.user, 'profile'):
-                profile = request.user.profile
+            # Stock Incharge validation
+            if profile.role == UserRole.STOCK_INCHARGE:
+                accessible_stores = profile.get_accessible_stores()
                 
-                # Stock Incharge validation
-                if profile.role == UserRole.STOCK_INCHARGE:
-                    accessible_stores = profile.get_accessible_stores()
+                if entry_type == 'ISSUE':
+                    # Validate from_location is an accessible store
+                    if from_location and from_location not in accessible_stores:
+                        raise serializers.ValidationError({
+                            'from_location': 'You can only issue from stores you manage'
+                        })
                     
-                    if entry_type == 'ISSUE':
-                        # Validate from_location is an accessible store
-                        if from_location and from_location not in accessible_stores:
-                            raise serializers.ValidationError({
-                                'from_location': 'You can only issue from stores you manage'
-                            })
-                        
-                        # CRITICAL FIX: Check if this is an upward transfer
-                        if from_location and to_location and from_location.is_main_store:
-                            parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
-                            
-                            # If to_location is the parent standalone, resolve to its main store
-                            if to_location == parent_standalone_for_issuance:
-                                # This is a valid upward transfer - get the main store
-                                target_main_store = to_location.get_main_store()
-                                if not target_main_store:
-                                    raise serializers.ValidationError({
-                                        'to_location': f'{to_location.name} does not have a main store'
-                                    })
-                                # Replace to_location with the main store
-                                data['to_location'] = target_main_store
-                            elif not profile.has_location_access(to_location):
-                                # Regular transfer - validate access
-                                raise serializers.ValidationError({
-                                    'to_location': f'You can only issue to locations within your hierarchy or to parent standalone location'
-                                })
-                    
-                    elif entry_type == 'RECEIPT':
-                        # Validate to_location is an accessible store
-                        if to_location and to_location not in accessible_stores:
-                            raise serializers.ValidationError({
-                                'to_location': 'You can only receive to stores you manage'
-                            })
-            
-            # Existing validation
-            if entry_type == 'RECEIPT':
-                if not to_location:
-                    raise serializers.ValidationError({'to_location': "Receipt must have a destination location"})
-                if not to_location.is_store:
-                    raise serializers.ValidationError({'to_location': "Receipt destination must be a store location"})
-            
-            elif entry_type == 'ISSUE':
-                if not from_location:
-                    raise serializers.ValidationError({'from_location': "Issue must have a source location"})
-                if not from_location.is_store:
-                    raise serializers.ValidationError({'from_location': "Issue source must be a store location"})
-                if not to_location:
-                    raise serializers.ValidationError({'to_location': "Issue must have a destination location"})
-                
-                # Check transfer permissions (after resolving standalone to main store)
-                if from_location and to_location:
-                    # Check if upward transfer
-                    if from_location.is_main_store:
+                    # CRITICAL FIX: Check if this is an upward transfer
+                    if from_location and to_location and from_location.is_main_store:
                         parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
-                        # Get parent standalone of to_location
-                        to_parent_standalone = to_location.get_parent_standalone()
                         
-                        # Valid if transferring to parent standalone's main store
-                        if to_parent_standalone == parent_standalone_for_issuance:
-                            # Valid upward transfer
-                            pass
-                        elif not from_location.can_transfer_to(to_location):
+                        # If to_location is the parent standalone, resolve to its main store
+                        if to_location == parent_standalone_for_issuance:
+                            # This is a valid upward transfer - get the main store
+                            target_main_store = to_location.get_main_store()
+                            if not target_main_store:
+                                raise serializers.ValidationError({
+                                    'to_location': f'{to_location.name} does not have a main store'
+                                })
+                            # Replace to_location with the main store
+                            data['to_location'] = target_main_store
+                        elif not profile.has_location_access(to_location):
+                            # Regular transfer - validate access
                             raise serializers.ValidationError({
-                                'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
+                                'to_location': f'You can only issue to locations within your hierarchy or to parent standalone location'
                             })
+                
+                elif entry_type == 'RECEIPT':
+                    # Validate to_location is an accessible store
+                    if to_location and to_location not in accessible_stores:
+                        raise serializers.ValidationError({
+                            'to_location': 'You can only receive to stores you manage'
+                        })
+        
+        # Existing validation
+        if entry_type == 'RECEIPT':
+            if not to_location:
+                raise serializers.ValidationError({'to_location': "Receipt must have a destination location"})
+            if not to_location.is_store:
+                raise serializers.ValidationError({'to_location': "Receipt destination must be a store location"})
+        
+        elif entry_type == 'ISSUE':
+            if not from_location:
+                raise serializers.ValidationError({'from_location': "Issue must have a source location"})
+            if not from_location.is_store:
+                raise serializers.ValidationError({'from_location': "Issue source must be a store location"})
+            if not to_location:
+                raise serializers.ValidationError({'to_location': "Issue must have a destination location"})
+            
+            # Check transfer permissions (after resolving standalone to main store)
+            if from_location and to_location:
+                # Check if upward transfer
+                if from_location.is_main_store:
+                    parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
+                    # Get parent standalone of to_location
+                    to_parent_standalone = to_location.get_parent_standalone()
+                    
+                    # Valid if transferring to parent standalone's main store
+                    if to_parent_standalone == parent_standalone_for_issuance:
+                        # Valid upward transfer
+                        pass
                     elif not from_location.can_transfer_to(to_location):
                         raise serializers.ValidationError({
                             'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
                         })
-                
-                if is_temporary:
-                    if not data.get('expected_return_date'):
-                        raise serializers.ValidationError({
-                            'expected_return_date': "Expected return date required for temporary issues"
-                        })
-                    if not data.get('temporary_recipient'):
-                        raise serializers.ValidationError({
-                            'temporary_recipient': "Recipient name required for temporary issues"
-                        })
-            
-            elif entry_type == 'CORRECTION':
-                if not data.get('reference_entry'):
+                elif not from_location.can_transfer_to(to_location):
                     raise serializers.ValidationError({
-                        'reference_entry': "Correction must have a reference entry"
+                        'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
                     })
             
-            return data
+            if is_temporary:
+                if not data.get('expected_return_date'):
+                    raise serializers.ValidationError({
+                        'expected_return_date': "Expected return date required for temporary issues"
+                    })
+                if not data.get('temporary_recipient'):
+                    raise serializers.ValidationError({
+                        'temporary_recipient': "Recipient name required for temporary issues"
+                    })
+        
+        elif entry_type == 'CORRECTION':
+            if not data.get('reference_entry'):
+                raise serializers.ValidationError({
+                    'reference_entry': "Correction must have a reference entry"
+                })
+        
+        return data
     
     def validate_instances(self, value):
         """Validate instances are available for issue"""
@@ -1743,12 +1803,12 @@ class StockEntrySerializer(serializers.ModelSerializer):
                 for i in range(stock_entry.quantity):
                     instance = ItemInstance.objects.create(
                         item=stock_entry.item,
+                        inspection_certificate=stock_entry.inspection_certificate,
                         source_location=stock_entry.to_location,
                         current_location=stock_entry.to_location,
                         current_status='IN_STORE',
                         condition='NEW',
                         purchase_date=timezone.now().date(),
-                        inspection_certificate=stock_entry.inspection_certificate,
                         created_by=user
                     )
                     created_instances.append(instance)
@@ -1757,6 +1817,126 @@ class StockEntrySerializer(serializers.ModelSerializer):
             stock_entry.instances.set(instances_data)
         
         return stock_entry
+
+
+# ==================== ITEM INSTANCE SERIALIZERS ====================
+class ItemInstanceSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_code = serializers.CharField(source='item.code', read_only=True)
+    current_location_name = serializers.CharField(source='current_location.name', read_only=True)
+    source_location_name = serializers.CharField(source='source_location.name', read_only=True)
+    location_path = serializers.SerializerMethodField()
+    
+    # Enhanced status fields
+    status_display = serializers.CharField(source='get_current_status_display', read_only=True)
+    previous_status_display = serializers.CharField(source='get_previous_status_display', read_only=True)
+    status_changed_by_name = serializers.CharField(source='status_changed_by.get_full_name', read_only=True)
+    
+    # Inspection certificate details
+    inspection_certificate_details = InspectionCertificateMinimalSerializer(
+        source='inspection_certificate', 
+        read_only=True
+    )
+    
+    # QR Code and Image
+    qr_code_image = serializers.SerializerMethodField()
+    qr_info = serializers.SerializerMethodField()
+    
+    # Availability flags
+    is_available = serializers.SerializerMethodField()
+    is_in_transit = serializers.SerializerMethodField()
+    is_issued = serializers.SerializerMethodField()
+    is_overdue = serializers.SerializerMethodField()
+    
+    # Assignment tracking
+    days_since_assigned = serializers.SerializerMethodField()
+    days_until_return = serializers.SerializerMethodField()
+    
+    # NEW: Return/rejection tracking
+    is_rejected = serializers.SerializerMethodField()
+    rejection_details = serializers.SerializerMethodField()
+    
+    condition_display = serializers.CharField(source='get_condition_display', read_only=True)
+    created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
+    
+    class Meta:
+        model = ItemInstance
+        fields = '__all__'
+        read_only_fields = ['instance_code', 'qr_code_data', 'qr_generated', 'qr_data_json',
+                           'previous_status', 'status_changed_at', 'status_changed_by']
+    
+    def get_location_path(self, obj):
+        return obj.current_location.get_full_path()
+    
+    def get_qr_code_image(self, obj):
+        if obj.qr_code_data:
+            return obj.qr_code_data
+        return None
+    
+    def get_qr_info(self, obj):
+        return obj.get_qr_info()
+    
+    def get_is_available(self, obj):
+        return obj.is_available()
+    
+    def get_is_in_transit(self, obj):
+        return obj.is_in_transit()
+    
+    def get_is_issued(self, obj):
+        return obj.is_issued()
+    
+    def get_is_overdue(self, obj):
+        return obj.is_overdue()
+    
+    def get_days_since_assigned(self, obj):
+        if obj.assigned_date:
+            delta = timezone.now().date() - obj.assigned_date.date()
+            return delta.days
+        return None
+    
+    def get_days_until_return(self, obj):
+        if obj.expected_return_date and not obj.actual_return_date:
+            delta = obj.expected_return_date - timezone.now().date()
+            return delta.days
+        return None
+    
+    def get_is_rejected(self, obj):
+        """Check if instance is part of a rejected/return entry"""
+        if obj.current_status == InstanceStatus.IN_TRANSIT:
+            # Check if there's a RETURN entry for this instance
+            return_entry = StockEntry.objects.filter(
+                instances=obj,
+                entry_type='RETURN',
+                status='PENDING_ACK'
+            ).exists()
+            return return_entry
+        return False
+    
+    def get_rejection_details(self, obj):
+        """Get details about rejection if applicable"""
+        if obj.current_status == InstanceStatus.IN_TRANSIT:
+            return_entry = StockEntry.objects.filter(
+                instances=obj,
+                entry_type='RETURN',
+                status='PENDING_ACK'
+            ).select_related('from_location', 'to_location', 'created_by').first()
+            
+            if return_entry:
+                return {
+                    'return_entry_number': return_entry.entry_number,
+                    'rejected_by_location': return_entry.from_location.name if return_entry.from_location else None,
+                    'returning_to': return_entry.to_location.name if return_entry.to_location else None,
+                    'rejection_reason': return_entry.remarks,
+                    'rejected_at': return_entry.created_at,
+                    'days_pending_return': (timezone.now() - return_entry.created_at).days
+                }
+        return None
+
+
+# Note: Keep all other serializers from the original file unchanged
+# (UserSerializer, UserProfileSerializer, LocationSerializer, CategorySerializer, 
+#  ItemSerializer, InspectionCertificateSerializer, InspectionItemSerializer, 
+#  LocationInventorySerializer, InstanceMovementSerializer, UserActivitySerializer, etc.)
 
 
 # ==================== INVENTORY SERIALIZERS ====================
