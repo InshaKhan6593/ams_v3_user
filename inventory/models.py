@@ -495,6 +495,7 @@ class Item(models.Model):
 class InspectionStage(models.TextChoices):
     INITIATED = 'INITIATED', 'Initiated - Basic Info'
     STOCK_DETAILS = 'STOCK_DETAILS', 'Stock Details Entry'
+    CENTRAL_REGISTER = 'CENTRAL_REGISTER', 'Central Register Entry'  # ← NEW STAGE
     AUDIT_REVIEW = 'AUDIT_REVIEW', 'Audit Review'
     COMPLETED = 'COMPLETED', 'Completed'
     REJECTED = 'REJECTED', 'Rejected'

@@ -25,12 +25,14 @@ class CanManageUsers(permissions.BasePermission):
         # Location Head can create Stock Incharge users
         if profile.role == UserRole.LOCATION_HEAD:
             if view.action in ['list', 'retrieve', 'create', 'my_profile', 'my_permissions', 
-                              'reset_password', 'toggle_active']:
+                              'reset_password', 'toggle_active', 'my_pending_tasks', 
+                              'my_item_default_locations']:
                 return True
             return False
         
-        # Others can only view their own profile
-        if view.action in ['retrieve', 'my_profile', 'my_permissions']:
+        # Others can only view their own profile and pending tasks
+        if view.action in ['retrieve', 'my_profile', 'my_permissions', 'my_pending_tasks',
+                          'my_item_default_locations']:
             return True
         
         return False
@@ -182,10 +184,26 @@ class CanManageItems(permissions.BasePermission):
         return False
 
 
+# permissions.py - FIXED InspectionCertificatePermission for 4-Stage Workflow
+# Replace the InspectionCertificatePermission class in permissions.py
+
+# permissions.py - CRITICAL FIX for 4-Stage Workflow
+# Replace the InspectionCertificatePermission class completely
+
 class InspectionCertificatePermission(permissions.BasePermission):
     """
-    Permission for inspection certificate operations with standalone location awareness.
-    Flow: Location Head (standalone) creates → Stock Incharge (main store) reviews → Auditor approves
+    Permission for inspection certificate operations with 4-STAGE workflow.
+    
+    4-STAGE WORKFLOW (Non-Root Departments):
+    Stage 1 (INITIATED): Location Head creates & adds items
+    Stage 2 (STOCK_DETAILS): Department Store Incharge fills stock register
+    Stage 3 (CENTRAL_REGISTER): Central Store Incharge fills central register
+    Stage 4 (AUDIT_REVIEW): Auditor completes
+    
+    3-STAGE WORKFLOW (Root Location):
+    Stage 1 (INITIATED): Location Head creates & adds items
+    Stage 2 (CENTRAL_REGISTER): Central Store Incharge fills central register
+    Stage 3 (AUDIT_REVIEW): Auditor completes
     """
     
     def has_permission(self, request, view):
@@ -202,27 +220,34 @@ class InspectionCertificatePermission(permissions.BasePermission):
         if profile.role == UserRole.SYSTEM_ADMIN:
             return True
         
-        # All authenticated users with profiles can list/retrieve/dashboard
-        if view.action in ['list', 'retrieve', 'dashboard_stats']:
+        # All authenticated users with profiles can list/retrieve/dashboard/creation_options
+        if view.action in ['list', 'retrieve', 'dashboard_stats', 'creation_options']:
             return True
         
         # Create action - only Location Head of standalone locations
         if view.action == 'create':
             return profile.can_create_inspection_certificates()
         
-        # Update actions - check basic permission, detailed check in has_object_permission
+        # Update actions - check basic permission
         if view.action in ['update', 'partial_update']:
             return profile.role in [UserRole.LOCATION_HEAD, UserRole.STOCK_INCHARGE, 
                                    UserRole.AUDITOR, UserRole.SYSTEM_ADMIN]
         
         # Custom action permissions
         if view.action == 'submit_to_stock_incharge':
+            # Stage 1 → Stage 2: Only Location Head
             return profile.role in [UserRole.LOCATION_HEAD, UserRole.SYSTEM_ADMIN]
         
         if view.action == 'submit_stock_details':
+            # Stage 2 → Stage 3: Only Department Store Incharge
+            return profile.role in [UserRole.STOCK_INCHARGE, UserRole.SYSTEM_ADMIN]
+        
+        if view.action == 'submit_central_register':
+            # Stage 3 → Stage 4: Only Central Store Incharge
             return profile.role in [UserRole.STOCK_INCHARGE, UserRole.SYSTEM_ADMIN]
         
         if view.action == 'submit_audit_review':
+            # Stage 4 → Complete: Auditor
             return profile.role in [UserRole.AUDITOR, UserRole.SYSTEM_ADMIN]
         
         if view.action == 'reject':
@@ -244,62 +269,120 @@ class InspectionCertificatePermission(permissions.BasePermission):
         if profile.role == UserRole.SYSTEM_ADMIN:
             return True
         
+        # Check if this is a root department certificate
+        is_root_cert = obj.department.parent_location is None
+        
         # For list and retrieve, check location access
         if view.action in ['list', 'retrieve', 'dashboard_stats']:
             # Auditor can view all
             if profile.role == UserRole.AUDITOR:
                 return True
             
-            # Others need location access
-            has_dept_access = profile.has_location_access(obj.department)
-            main_store = obj.get_main_store()
-            has_store_access = main_store and profile.has_location_access(main_store)
-            
+            # Location Head needs department access
             if profile.role == UserRole.LOCATION_HEAD:
-                return has_dept_access
+                return profile.has_location_access(obj.department)
+            
+            # Stock Incharge needs store access
             elif profile.role == UserRole.STOCK_INCHARGE:
-                return has_store_access
+                main_store = obj.get_main_store()
+                
+                # Department store incharge can view if they have access to the main store
+                has_dept_store_access = main_store and profile.has_location_access(main_store)
+                
+                # OR they're the central store incharge (can view all certificates in CENTRAL_REGISTER or AUDIT_REVIEW)
+                is_central_store = profile.is_main_store_incharge()
+                
+                # Can view if they have dept store access OR they're central store (for CENTRAL_REGISTER/AUDIT_REVIEW stage)
+                if has_dept_store_access:
+                    return True
+                if is_central_store and obj.stage in ['CENTRAL_REGISTER', 'AUDIT_REVIEW']:
+                    return True
+                
+                return False
             
             return False
         
-        # CUSTOM ACTIONS
+        # CUSTOM ACTIONS - 4-STAGE WORKFLOW
         if view.action == 'submit_to_stock_incharge':
-            # Location Head submitting to Stock Incharge
+            # Stage 1 → Stage 2: Location Head submitting
             if obj.stage != 'INITIATED':
                 return False
             return profile.has_location_access(obj.department)
         
         if view.action == 'submit_stock_details':
-            # Stock Incharge submitting stock details
+            # Stage 2 → Stage 3: Department Store Incharge submitting
             if obj.stage != 'STOCK_DETAILS':
                 return False
+            
+            # CRITICAL FIX: Must be department store incharge, NOT central
+            if profile.is_main_store_incharge():
+                # Central store should NOT submit stock details
+                return False
+            
+            # Check if user has access to the department's main store
             main_store = obj.get_main_store()
             return main_store and profile.has_location_access(main_store)
         
+        if view.action == 'submit_central_register':
+            # Stage 3 → Stage 4: Central Store Incharge submitting
+            if obj.stage != 'CENTRAL_REGISTER':
+                return False
+            
+            # Must be central store incharge
+            if profile.role == UserRole.STOCK_INCHARGE:
+                return profile.is_main_store_incharge()
+            
+            return False
+        
         if view.action == 'submit_audit_review':
-            # Auditor completing the certificate
-            return obj.stage == 'AUDIT_REVIEW'
+            # Stage 4 → Complete: Auditor
+            if obj.stage != 'AUDIT_REVIEW':
+                return False
+            
+            if profile.role == UserRole.AUDITOR:
+                return True
+            
+            return False
         
         if view.action == 'reject':
-            # Auditor rejecting (at any stage except completed/rejected)
+            # Auditor can reject at any stage except completed/rejected
             return obj.stage not in ['COMPLETED', 'REJECTED']
         
-        # UPDATE/PARTIAL_UPDATE actions
+        # UPDATE/PARTIAL_UPDATE actions - CRITICAL: Stage-based permissions
         if view.action in ['update', 'partial_update']:
-            # Check based on role and stage
-            if profile.role == UserRole.AUDITOR:
-                return obj.stage == 'AUDIT_REVIEW'
-            
-            if profile.role == UserRole.STOCK_INCHARGE:
-                if obj.stage != 'STOCK_DETAILS':
+            # Stage 1: ONLY Location Head
+            if obj.stage == 'INITIATED':
+                if profile.role == UserRole.LOCATION_HEAD:
+                    return profile.has_location_access(obj.department)
+                # CRITICAL: Stock Incharge CANNOT edit in INITIATED stage
+                elif profile.role == UserRole.STOCK_INCHARGE:
                     return False
-                main_store = obj.get_main_store()
-                return main_store and profile.has_location_access(main_store)
+                return False
             
-            if profile.role == UserRole.LOCATION_HEAD:
-                if obj.stage != 'INITIATED':
-                    return False
-                return profile.has_location_access(obj.department)
+            # Stage 2: ONLY Department Store Incharge (NOT central store)
+            elif obj.stage == 'STOCK_DETAILS':
+                if profile.role == UserRole.STOCK_INCHARGE:
+                    # CRITICAL FIX: Must NOT be central store incharge
+                    if profile.is_main_store_incharge():
+                        return False
+                    
+                    # Must have access to the department's main store
+                    main_store = obj.get_main_store()
+                    return main_store and profile.has_location_access(main_store)
+                return False
+            
+            # Stage 3: CENTRAL_REGISTER - Central Store Incharge ONLY
+            elif obj.stage == 'CENTRAL_REGISTER':
+                if profile.role == UserRole.STOCK_INCHARGE:
+                    # CRITICAL: Must BE central store incharge
+                    return profile.is_main_store_incharge()
+                return False
+            
+            # Stage 4: AUDIT_REVIEW - Auditor ONLY
+            elif obj.stage == 'AUDIT_REVIEW':
+                if profile.role == UserRole.AUDITOR:
+                    return True
+                return False
         
         return False
 

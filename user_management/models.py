@@ -390,16 +390,31 @@ class UserProfile(models.Model):
     
     def is_main_store_incharge(self):
         """
-        Check if this Stock Incharge manages a main store.
-        Main store incharges have special permission to issue UP the hierarchy.
+        Check if this Stock Incharge manages the ROOT/CENTRAL main store.
+        Only the root location's main store incharge returns True.
+        
+        IMPORTANT: This is different from managing ANY main store.
+        Every standalone location has a main store, but only ONE is the central store.
         """
         if self.role != UserRole.STOCK_INCHARGE:
             return False
         
-        # Check if any assigned store is a main store
+        # Get the root location (parent_location is None)
+        from inventory.models import Location
+        root_location = Location.objects.filter(parent_location__isnull=True, is_active=True).first()
+        
+        if not root_location:
+            return False
+        
+        # Get the root location's main store
+        root_main_store = root_location.get_main_store()
+        
+        if not root_main_store:
+            return False
+        
+        # Check if user is assigned to the root's main store
         return self.assigned_locations.filter(
-            is_store=True,
-            is_main_store=True,
+            id=root_main_store.id,
             is_active=True
         ).exists()
     
@@ -503,6 +518,48 @@ class UserProfile(models.Model):
             'accessible_standalone_count': self.get_standalone_locations().count(),
         }
     
+    def is_department_store_incharge(self):
+        """
+        Check if this Stock Incharge manages a department's main store.
+        (Not the root/central store)
+        """
+        if self.role != UserRole.STOCK_INCHARGE:
+            return False
+        
+        # If they're the central store incharge, they're not a department store incharge
+        if self.is_main_store_incharge():
+            return False
+        
+        # Check if they manage any main store (that's not the root's)
+        return self.assigned_locations.filter(
+            is_store=True,
+            is_main_store=True,
+            is_active=True
+        ).exists()
+
+
+    def can_issue_to_parent_standalone(self):
+        """
+        Check if user can issue items to parent standalone location.
+        Only ROOT main store incharges can do this.
+        """
+        if not self.is_main_store_incharge():
+            return False
+        
+        # Get the root's main store they manage
+        from inventory.models import Location
+        root_location = Location.objects.filter(parent_location__isnull=True, is_active=True).first()
+        
+        if not root_location:
+            return False
+        
+        main_store = root_location.get_main_store()
+        
+        if not main_store:
+            return False
+        
+        return main_store.can_issue_to_parent_standalone()
+        
     def save(self, *args, **kwargs):
         # Generate employee ID if not set
         if not self.employee_id:

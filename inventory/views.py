@@ -1,4 +1,4 @@
-# views.py - ENHANCED VERSION (Part 1: Auth & User Management)
+# views.py - ENHANCED VERSION
 from rest_framework import viewsets, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -41,6 +41,9 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 # Get permissions summary
                 permissions = profile.get_permissions_summary()
                 
+                # Get pending tasks count
+                pending_tasks = self._get_pending_tasks_count(user, profile)
+                
                 response.data['user'] = {
                     'id': user.id,
                     'username': user.username,
@@ -52,6 +55,7 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                     'accessible_stores': LocationMinimalSerializer(profile.get_accessible_stores(), many=True).data,
                     'accessible_standalone': LocationMinimalSerializer(profile.get_standalone_locations(), many=True).data,
                     'permissions': permissions,
+                    'pending_tasks': pending_tasks,
                 }
                 
                 # Log activity
@@ -59,6 +63,7 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                     user=user,
                     action='LOGIN',
                     model='User',
+                    object_id=user.id,
                     ip_address=self.get_client_ip(request)
                 )
                 
@@ -71,6 +76,52 @@ class CustomTokenObtainPairView(TokenObtainPairView):
                 print(f"Login error: {e}")
         
         return response
+    
+    def _get_pending_tasks_count(self, user, profile):
+        """Get count of pending tasks for the user"""
+        pending = {
+            'total': 0,
+            'acknowledgments': 0,
+            'inspections': 0,
+        }
+        
+        if profile.role == UserRole.STOCK_INCHARGE:
+            # Pending acknowledgments for stock entries
+            accessible_stores = profile.get_accessible_stores()
+            pending['acknowledgments'] = StockEntry.objects.filter(
+                status='PENDING_ACK',
+                to_location__in=accessible_stores
+            ).count()
+            
+            # Pending inspection stock details
+            department_ids = set()
+            for store in accessible_stores:
+                if store.is_main_store and store.parent_location:
+                    parent_standalone = store.get_parent_standalone()
+                    if parent_standalone:
+                        department_ids.add(parent_standalone.id)
+            
+            pending['inspections'] = InspectionCertificate.objects.filter(
+                department_id__in=department_ids,
+                stage='STOCK_DETAILS'
+            ).count()
+            
+        elif profile.role == UserRole.LOCATION_HEAD:
+            # Pending inspection initiation
+            accessible_locations = profile.get_accessible_locations()
+            pending['inspections'] = InspectionCertificate.objects.filter(
+                department__in=accessible_locations,
+                stage='INITIATED'
+            ).count()
+            
+        elif profile.role == UserRole.AUDITOR:
+            # Pending audit reviews
+            pending['inspections'] = InspectionCertificate.objects.filter(
+                stage='AUDIT_REVIEW'
+            ).count()
+        
+        pending['total'] = pending['acknowledgments'] + pending['inspections']
+        return pending
     
     def get_client_ip(self, request):
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -176,6 +227,75 @@ class UserProfileViewSet(viewsets.ModelViewSet):
         return Response(permissions)
     
     @action(detail=False, methods=['get'])
+    def my_pending_tasks(self, request):
+        """Get pending tasks for current user"""
+        if not hasattr(request.user, 'profile'):
+            return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        profile = request.user.profile
+        pending_tasks = self._get_user_pending_tasks(request.user, profile)
+        
+        return Response(pending_tasks)
+    
+    def _get_user_pending_tasks(self, user, profile):
+        """Get detailed pending tasks for user"""
+        tasks = {
+            'acknowledgments': [],
+            'inspections': [],
+            'counts': {
+                'total': 0,
+                'acknowledgments': 0,
+                'inspections': 0,
+            }
+        }
+        
+        if profile.role == UserRole.STOCK_INCHARGE:
+            accessible_stores = profile.get_accessible_stores()
+            
+            # Pending acknowledgments
+            pending_ack = StockEntry.objects.filter(
+                status='PENDING_ACK',
+                to_location__in=accessible_stores
+            ).select_related('item', 'from_location', 'to_location')
+            
+            tasks['acknowledgments'] = StockEntrySerializer(pending_ack, many=True).data
+            tasks['counts']['acknowledgments'] = pending_ack.count()
+            
+            # Pending inspection stock details
+            department_ids = set()
+            for store in accessible_stores:
+                if store.is_main_store and store.parent_location:
+                    parent_standalone = store.get_parent_standalone()
+                    if parent_standalone:
+                        department_ids.add(parent_standalone.id)
+            
+            pending_inspections = InspectionCertificate.objects.filter(
+                department_id__in=department_ids,
+                stage='STOCK_DETAILS'
+            )
+            tasks['inspections'] = InspectionCertificateSerializer(pending_inspections, many=True).data
+            tasks['counts']['inspections'] = pending_inspections.count()
+            
+        elif profile.role == UserRole.LOCATION_HEAD:
+            accessible_locations = profile.get_accessible_locations()
+            pending_inspections = InspectionCertificate.objects.filter(
+                department__in=accessible_locations,
+                stage='INITIATED'
+            )
+            tasks['inspections'] = InspectionCertificateSerializer(pending_inspections, many=True).data
+            tasks['counts']['inspections'] = pending_inspections.count()
+            
+        elif profile.role == UserRole.AUDITOR:
+            pending_inspections = InspectionCertificate.objects.filter(
+                stage='AUDIT_REVIEW'
+            )
+            tasks['inspections'] = InspectionCertificateSerializer(pending_inspections, many=True).data
+            tasks['counts']['inspections'] = pending_inspections.count()
+        
+        tasks['counts']['total'] = tasks['counts']['acknowledgments'] + tasks['counts']['inspections']
+        return tasks
+    
+    @action(detail=False, methods=['get'])
     def my_item_default_locations(self, request):
         """Get standalone locations that can be used as item default locations"""
         if not hasattr(request.user, 'profile'):
@@ -188,9 +308,6 @@ class UserProfileViewSet(viewsets.ModelViewSet):
             'standalone_locations': LocationMinimalSerializer(default_locations, many=True).data,
             'message': 'Items must belong to standalone locations'
         })
-
-# views.py - ENHANCED VERSION (Part 2: Location ViewSet)
-# This continues from part 1
 
 # ==================== LOCATION VIEWSET ====================
 class LocationViewSet(viewsets.ModelViewSet):
@@ -451,7 +568,7 @@ class LocationViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['get'])
     def issuance_targets(self, request, pk=None):
-        """Get locations this store can issue to (including upward for main stores)"""
+        """Get locations this store can issue to based on complex hierarchy rules"""
         location = self.get_object()
         
         if not location.is_store:
@@ -459,33 +576,63 @@ class LocationViewSet(viewsets.ModelViewSet):
                 'error': 'Only stores can have issuance targets'
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        # Get all locations in same hierarchy
+        # Get parent standalone
         parent_standalone = location.get_parent_standalone()
         if not parent_standalone:
             return Response({
-                'targets': [],
+                'internal_targets': [],
+                'standalone_targets': [],
                 'can_issue_upward': False
             })
         
-        targets = parent_standalone.get_descendants(include_self=True)
+        internal_targets = []  # Non-standalone locations within hierarchy
+        standalone_targets = []  # Standalone locations for upward transfer
         
-        # Check if can issue upward
-        can_issue_upward = location.can_issue_to_parent_standalone()
-        upward_target = None
-        if can_issue_upward:
-            upward_target = location.get_parent_standalone_for_issuance()
+        if location.is_main_store:
+            # Main store can issue to:
+            # 1. Non-standalone locations within parent standalone
+            descendants = parent_standalone.get_descendants(include_self=False)
+            internal_targets = descendants.filter(
+                is_standalone=False,
+                is_store=False,
+                is_active=True
+            )
+            
+            # 2. Standalone locations within parent (for transfer to their main store)
+            standalone_targets = descendants.filter(
+                is_standalone=True,
+                is_active=True
+            )
+            
+            # 3. Can issue upward to parent of parent standalone
+            can_issue_upward = parent_standalone.parent_location is not None
+            upward_target = None
+            if can_issue_upward and parent_standalone.parent_location:
+                upward_standalone = parent_standalone.parent_location.get_parent_standalone()
+                if upward_standalone:
+                    upward_target = upward_standalone
+        else:
+            # Non-main store can only issue within same standalone location
+            descendants = parent_standalone.get_descendants(include_self=False)
+            internal_targets = descendants.filter(
+                is_standalone=False,
+                is_store=False,
+                is_active=True
+            )
+            can_issue_upward = False
+            upward_target = None
         
         response_data = {
             'location': LocationMinimalSerializer(location).data,
             'parent_standalone': LocationMinimalSerializer(parent_standalone).data,
-            'hierarchy_targets': LocationMinimalSerializer(targets, many=True).data,
+            'internal_targets': LocationMinimalSerializer(internal_targets, many=True).data,
+            'standalone_targets': LocationMinimalSerializer(standalone_targets, many=True).data,
             'can_issue_upward': can_issue_upward,
-            'upward_target': LocationMinimalSerializer(upward_target).data if upward_target else None
+            'upward_target': LocationMinimalSerializer(upward_target).data if upward_target else None,
+            'is_main_store': location.is_main_store
         }
         
         return Response(response_data)
-
-# Continuing with remaining viewsets...
 
 # ==================== CATEGORY VIEWSET ====================
 class CategoryViewSet(viewsets.ModelViewSet):
@@ -553,21 +700,35 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
         if profile.role in [UserRole.SYSTEM_ADMIN, UserRole.AUDITOR]:
             pass
         elif profile.role == UserRole.STOCK_INCHARGE:
-            # Get departments where user's store is the main store
-            accessible_stores = profile.get_accessible_stores()
-            department_ids = set()
-            
-            for store in accessible_stores:
-                if store.is_main_store and store.parent_location:
-                    # This is a main store, get its parent standalone
-                    parent_standalone = store.get_parent_standalone()
-                    if parent_standalone:
-                        department_ids.add(parent_standalone.id)
-            
-            if department_ids:
-                queryset = queryset.filter(department_id__in=department_ids)
+            # CRITICAL FIX: Central Store Incharge vs Department Store Incharge
+            if profile.is_main_store_incharge():
+                # Central Store Incharge (Root location's main store)
+                # Can see ALL certificates that are in CENTRAL_REGISTER or AUDIT_REVIEW stage
+                # (because they need to fill central register for ALL departments)
+                queryset = queryset.filter(
+                    stage__in=['CENTRAL_REGISTER', 'AUDIT_REVIEW']
+                )
             else:
-                queryset = queryset.none()
+                # Department Store Incharge
+                # Can only see certificates from their own department in STOCK_DETAILS stage
+                accessible_stores = profile.get_accessible_stores()
+                department_ids = set()
+                
+                for store in accessible_stores:
+                    if store.is_main_store and store.parent_location:
+                        # This is a main store, get its parent standalone
+                        parent_standalone = store.get_parent_standalone()
+                        if parent_standalone:
+                            department_ids.add(parent_standalone.id)
+                
+                if department_ids:
+                    # Only show STOCK_DETAILS stage certificates for their department
+                    queryset = queryset.filter(
+                        department_id__in=department_ids,
+                        stage='STOCK_DETAILS'
+                    )
+                else:
+                    queryset = queryset.none()
         else:
             # Location Head
             accessible_locations = profile.get_accessible_locations()
@@ -594,23 +755,69 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
         
         profile = self.request.user.profile
         
-        if not profile.can_create_inspection_certificates():
-            raise PermissionDenied("Only Location Heads of standalone locations can create inspection certificates")
+        # System admin can create for any location
+        if profile.role != UserRole.SYSTEM_ADMIN:
+            if not profile.can_create_inspection_certificates():
+                raise PermissionDenied("Only Location Heads of standalone locations can create inspection certificates")
+            
+            department = serializer.validated_data.get('department')
+            if department and not profile.has_location_access(department):
+                raise PermissionDenied("You don't have access to this department")
         
         department = serializer.validated_data.get('department')
-        if department and not profile.has_location_access(department):
-            raise PermissionDenied("You don't have access to this department")
-        
         main_store = department.get_main_store()
         if not main_store:
             raise PermissionDenied(f"Department {department.name} does not have a main store configured")
         
-        serializer.save()
+        serializer.save(
+            initiated_by=self.request.user,
+            initiated_at=timezone.now(),
+            created_by=self.request.user
+        )
+    
+    @action(detail=False, methods=['get'])
+    def creation_options(self, request):
+        """Get options for creating inspection certificates"""
+        if not hasattr(request.user, 'profile'):
+            return Response({'error': 'Profile not found'}, status=404)
+        
+        profile = request.user.profile
+        
+        if profile.role == UserRole.SYSTEM_ADMIN:
+            # System admin can create for any standalone location
+            departments = Location.objects.filter(
+                is_standalone=True,
+                is_active=True
+            )
+            can_select_department = True
+        elif profile.role == UserRole.LOCATION_HEAD:
+            # Location head can only create for their locations
+            accessible = profile.get_accessible_locations()
+            departments = accessible.filter(is_standalone=True)
+            # If only one department, it should be fixed
+            can_select_department = departments.count() > 1
+        else:
+            departments = Location.objects.none()
+            can_select_department = False
+        
+        return Response({
+            'departments': LocationMinimalSerializer(departments, many=True).data,
+            'can_select_department': can_select_department,
+            'user_role': profile.role
+        })
     
     @action(detail=True, methods=['post'])
     @transaction.atomic
     def submit_to_stock_incharge(self, request, pk=None):
-        """Location Head submits certificate to Stock Incharge of main store"""
+        """
+        Location Head submits certificate to Stock Incharge.
+        
+        WORKFLOW LOGIC:
+        - Root Location: INITIATED -> CENTRAL_REGISTER (skip STOCK_DETAILS)
+        Goes directly to Central Store for central register
+        - Non-Root Location: INITIATED -> STOCK_DETAILS
+        Goes to Department Store for stock register first
+        """
         inspection = self.get_object()
         
         if inspection.stage != 'INITIATED':
@@ -630,24 +837,61 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
             serializer.is_valid(raise_exception=True)
             serializer.save()
         
-        inspection.transition_stage('STOCK_DETAILS', request.user)
+        # CRITICAL: Check if department is root location
+        is_root_department = inspection.department.parent_location is None
         
-        return Response({
-            'message': f'Certificate submitted to Stock Incharge of {main_store.name}',
-            'new_stage': inspection.stage,
-            'main_store': main_store.name,
-            'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
-        })
+        if is_root_department:
+            # ROOT LOCATION FLOW (3 stages):
+            # Stage 1: Location Head -> Stage 2: Central Store -> Stage 3: Auditor
+            inspection.transition_stage('CENTRAL_REGISTER', request.user)
+            
+            return Response({
+                'message': 'Certificate submitted to Central Store Incharge for central register entry',
+                'new_stage': inspection.stage,
+                'stage_display': inspection.get_stage_display(),
+                'main_store': main_store.name,
+                'is_root_flow': True,
+                'workflow': 'Root Location: 3-stage workflow (Location Head -> Central Store -> Auditor)',
+                'next_step': 'Central Store Incharge will fill central register details and consignee information',
+                'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
+            })
+        else:
+            # NON-ROOT LOCATION FLOW (4 stages):
+            # Stage 1: Location Head -> Stage 2: Dept Store -> Stage 3: Central Store -> Stage 4: Auditor
+            inspection.transition_stage('STOCK_DETAILS', request.user)
+            
+            return Response({
+                'message': f'Certificate submitted to Department Store Incharge of {main_store.name}',
+                'new_stage': inspection.stage,
+                'stage_display': inspection.get_stage_display(),
+                'main_store': main_store.name,
+                'is_root_flow': False,
+                'workflow': 'Department Flow: 4-stage workflow (Location Head -> Dept Store -> Central Store -> Auditor)',
+                'next_step': 'Department Store Incharge will fill stock register details',
+                'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
+            })
     
     @action(detail=True, methods=['post'])
     @transaction.atomic
     def submit_stock_details(self, request, pk=None):
-        """Stock Incharge submits stock details"""
+        """
+        Department Store Incharge submits stock details (NON-ROOT ONLY).
+        Stage 2 -> Stage 3: STOCK_DETAILS -> CENTRAL_REGISTER
+        
+        After this, it goes to Central Store Incharge for central register.
+        """
         inspection = self.get_object()
         
         if inspection.stage != 'STOCK_DETAILS':
             return Response({
                 'error': f'Certificate must be in STOCK_DETAILS stage, currently in {inspection.stage}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Verify this is NOT root location (root skips STOCK_DETAILS)
+        is_root_department = inspection.department.parent_location is None
+        if is_root_department:
+            return Response({
+                'error': 'Root location certificates should not be in STOCK_DETAILS stage. They skip directly to CENTRAL_REGISTER.'
             }, status=status.HTTP_400_BAD_REQUEST)
         
         # Update with submitted data
@@ -659,22 +903,112 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
         items_count = inspection.inspection_items.count()
         if items_count == 0:
             return Response({
-                'error': 'At least one inspection item is required. Please add items first.',
+                'error': 'At least one inspection item is required.',
             }, status=status.HTTP_400_BAD_REQUEST)
         
+        # Validate stock register fields are filled for at least one item
+        items_with_stock_register = inspection.inspection_items.exclude(
+            Q(stock_register_no__isnull=True) | Q(stock_register_no='')
+        ).count()
+
+        if items_with_stock_register == 0:
+            # Try refreshing to get latest data from database
+            inspection.refresh_from_db()
+            items_with_stock_register = inspection.inspection_items.exclude(
+                Q(stock_register_no__isnull=True) | Q(stock_register_no='')
+            ).count()
+            
+            if items_with_stock_register == 0:
+                return Response({
+                    'error': 'Please fill stock register details for at least one item before submitting.',
+                    'hint': 'Fill Stock Register No, Page No, and Entry Date for at least one item.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Transition to CENTRAL_REGISTER for Central Store
+        inspection.transition_stage('CENTRAL_REGISTER', request.user)
+        
+        return Response({
+            'message': 'Stock details submitted. Now forwarding to Central Store Incharge for central register entry.',
+            'new_stage': inspection.stage,
+            'stage_display': inspection.get_stage_display(),
+            'items_count': items_count,
+            'items_with_stock_register': items_with_stock_register,
+            'next_step': 'Central Store Incharge will fill central register details',
+            'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
+        })
+    
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def submit_central_register(self, request, pk=None):
+        """
+        Central Store Incharge submits central register details.
+        Stage 3 -> Stage 4: CENTRAL_REGISTER -> AUDIT_REVIEW
+        
+        This happens for:
+        - NON-ROOT: After department store fills stock details
+        - ROOT: After location head initiates (skips STOCK_DETAILS)
+        """
+        inspection = self.get_object()
+        
+        if inspection.stage != 'CENTRAL_REGISTER':
+            return Response({
+                'error': f'Certificate must be in CENTRAL_REGISTER stage, currently in {inspection.stage}'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Update with submitted data
+        if request.data:
+            serializer = self.get_serializer(inspection, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+        
+        # Validate central register fields are filled
+        items_with_central_register = inspection.inspection_items.filter(
+            central_register_no__isnull=False
+        ).count()
+        
+        total_items = inspection.inspection_items.count()
+        
+        if items_with_central_register == 0:
+            return Response({
+                'error': 'Please fill central register details for at least one item before submitting.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if this is root certificate
+        is_root_cert = inspection.department.parent_location is None
+        
+        # For root certificates, also validate consignee details are filled
+        if is_root_cert:
+            if not inspection.consignee_name or not inspection.consignee_designation:
+                return Response({
+                    'error': 'Please fill consignee name and designation before submitting.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Transition to AUDIT_REVIEW for Auditor
         inspection.transition_stage('AUDIT_REVIEW', request.user)
         
         return Response({
-            'message': f'Stock details with {items_count} items submitted successfully',
+            'message': 'Central register details submitted. Now forwarding to Auditor for final review.',
             'new_stage': inspection.stage,
-            'items_count': items_count,
+            'stage_display': inspection.get_stage_display(),
+            'items_filled': items_with_central_register,
+            'total_items': total_items,
+            'is_root_flow': is_root_cert,
+            'next_step': 'Auditor will complete the final verification and create item instances',
             'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
         })
     
     @action(detail=True, methods=['post'])
     @transaction.atomic
     def submit_audit_review(self, request, pk=None):
-        """Auditor completes audit and creates stock entries in main store"""
+        """
+        Auditor completes the certificate and creates stock entries.
+        Stage 4 -> Complete: AUDIT_REVIEW -> COMPLETED
+        
+        This is the final stage where:
+        1. Auditor fills finance/dead stock register details
+        2. Certificate is marked as COMPLETED
+        3. Item instances are created in the main store
+        """
         inspection = self.get_object()
         
         if inspection.stage != 'AUDIT_REVIEW':
@@ -688,11 +1022,32 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
                 'error': 'No main store found for this department'
             }, status=status.HTTP_400_BAD_REQUEST)
         
-        # Update audit details
-        serializer = self.get_serializer(inspection, data=request.data, partial=True)
-        serializer.is_valid(raise_exception=True)
-        serializer.save()
+        # Update with submitted data
+        if request.data:
+            serializer = self.get_serializer(inspection, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
         
+        # Validate that central register is filled
+        items_with_central_register = inspection.inspection_items.filter(
+            central_register_no__isnull=False
+        ).count()
+        
+        if items_with_central_register == 0:
+            return Response({
+                'error': 'Central Store must fill central register details before Auditor can complete the certificate.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Check if this is root certificate
+        is_root_cert = inspection.department.parent_location is None
+        
+        # Validate consignee details are filled
+        if not inspection.consignee_name or not inspection.consignee_designation:
+            return Response({
+                'error': 'Consignee name and designation must be filled before completion.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Transition to COMPLETED
         inspection.transition_stage('COMPLETED', request.user)
         
         # Create instances in main store
@@ -701,10 +1056,20 @@ class InspectionCertificateViewSet(viewsets.ModelViewSet):
         return Response({
             'message': f'Audit completed successfully. Created {created_instances_count} instances in {main_store.name}.',
             'new_stage': inspection.stage,
+            'stage_display': inspection.get_stage_display(),
             'instances_created': created_instances_count,
             'main_store': main_store.name,
+            'is_root_flow': is_root_cert,
+            'workflow_completed': True,
             'certificate': InspectionCertificateSerializer(inspection, context={'request': request}).data
         })
+        
+    def _is_root_department(self, department):
+        """
+        Check if a department is the root location (Main University).
+        Root location has no parent_location.
+        """
+        return department.parent_location is None
     
     def _create_stock_from_inspection(self, inspection, user, main_store):
         """Create stock entries and instances in main store after audit approval"""
@@ -817,7 +1182,7 @@ class StockEntryViewSet(viewsets.ModelViewSet):
     
     @action(detail=False, methods=['get'])
     def create_options(self, request):
-        """Get options for creating stock entries with upward transfer support"""
+        """Get options for creating stock entries with proper target filtering"""
         if not hasattr(request.user, 'profile'):
             return Response({'error': 'Profile not found'}, status=status.HTTP_404_NOT_FOUND)
         
@@ -826,12 +1191,53 @@ class StockEntryViewSet(viewsets.ModelViewSet):
         # From locations: accessible stores
         from_locations = profile.get_accessible_stores()
         
-        # To locations: all accessible locations
-        accessible_locations = profile.get_accessible_locations()
+        # Build comprehensive issuance targets based on store type
+        all_internal_targets = []
+        all_standalone_targets = []
+        can_issue_upward = False
+        upward_target = None
         
-        # Check if user is main store incharge (can issue upward)
-        can_issue_upward = profile.can_issue_to_parent_standalone()
-        parent_standalone_for_upward = profile.get_parent_standalone_for_issuance()
+        for store in from_locations:
+            parent_standalone = store.get_parent_standalone()
+            if not parent_standalone:
+                continue
+            
+            if store.is_main_store:
+                # Main store targets
+                descendants = parent_standalone.get_descendants(include_self=False)
+                
+                # Internal targets: non-standalone locations (including other stores)
+                internal = descendants.filter(
+                    is_standalone=False,
+                    is_active=True
+                )
+                all_internal_targets.extend(list(internal))
+                
+                # Standalone targets for cross-location transfer
+                standalone = descendants.filter(
+                    is_standalone=True,
+                    is_active=True
+                )
+                all_standalone_targets.extend(list(standalone))
+                
+                # Check upward issuance
+                if parent_standalone.parent_location:
+                    can_issue_upward = True
+                    upward_standalone = parent_standalone.parent_location.get_parent_standalone()
+                    if upward_standalone:
+                        upward_target = upward_standalone
+            else:
+                # Non-main store - internal targets within same standalone (including other stores)
+                descendants = parent_standalone.get_descendants(include_self=False)
+                internal = descendants.filter(
+                    is_standalone=False,
+                    is_active=True
+                )
+                all_internal_targets.extend(list(internal))
+        
+        # Remove duplicates
+        internal_targets = list({loc.id: loc for loc in all_internal_targets}.values())
+        standalone_targets = list({loc.id: loc for loc in all_standalone_targets}.values())
         
         # Get available items
         available_items = Item.objects.filter(
@@ -840,13 +1246,13 @@ class StockEntryViewSet(viewsets.ModelViewSet):
         
         response_data = {
             'from_locations': LocationMinimalSerializer(from_locations, many=True).data,
-            'to_locations': LocationMinimalSerializer(accessible_locations, many=True).data,
+            'internal_targets': LocationMinimalSerializer(internal_targets, many=True).data,
+            'standalone_targets': LocationMinimalSerializer(standalone_targets, many=True).data,
             'available_items': ItemMinimalSerializer(available_items, many=True).data,
             'user_role': profile.role,
             'can_issue_upward': can_issue_upward,
-            'parent_standalone_for_upward': LocationMinimalSerializer(
-                parent_standalone_for_upward
-            ).data if parent_standalone_for_upward else None
+            'upward_target': LocationMinimalSerializer(upward_target).data if upward_target else None,
+            'is_main_store_incharge': profile.is_main_store_incharge()
         }
         
         return Response(response_data)
@@ -932,37 +1338,92 @@ class StockEntryViewSet(viewsets.ModelViewSet):
         accepted_ids = request.data.get('accepted_instances', [])
         rejected_ids = request.data.get('rejected_instances', [])
         
-        # Process accepted: Transfer ownership to destination
-        accepted_instances = ItemInstance.objects.filter(id__in=accepted_ids)
-        for instance in accepted_instances:
-            instance.source_location = stock_entry.to_location  # Transfer ownership
-            instance.current_location = stock_entry.to_location
-            instance.current_status = InstanceStatus.IN_STORE
-            instance.save()
+        if not accepted_ids and not rejected_ids:
+            return Response({'error': 'Must accept or reject at least one instance'}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Process rejected: Create return entry
+        # CRITICAL FIX: Create RECEIPT stock entry for accepted items
+        if accepted_ids:
+            accepted_instances = ItemInstance.objects.filter(id__in=accepted_ids)
+            
+            # Create RECEIPT entry
+            receipt_entry = StockEntry.objects.create(
+                entry_type='RECEIPT',
+                from_location=stock_entry.from_location,
+                to_location=stock_entry.to_location,
+                item=stock_entry.item,
+                quantity=len(accepted_ids),
+                purpose=f"Receipt from transfer {stock_entry.entry_number}",
+                remarks=f"Acknowledged by {request.user.get_full_name()}",
+                reference_entry=stock_entry,
+                status='COMPLETED',
+                created_by=request.user,
+                acknowledged_by=request.user,
+                acknowledged_at=timezone.now()
+            )
+            receipt_entry.instances.set(accepted_instances)
+            
+            # Transfer ownership to destination store
+            for instance in accepted_instances:
+                instance.source_location = stock_entry.to_location  # Transfer ownership
+                instance.current_location = stock_entry.to_location
+                instance.current_status = InstanceStatus.IN_STORE
+                instance.save()
+                
+                # Create movement record
+                InstanceMovement.objects.create(
+                    instance=instance,
+                    stock_entry=receipt_entry,
+                    from_location=stock_entry.from_location,
+                    to_location=stock_entry.to_location,
+                    previous_status=InstanceStatus.IN_TRANSIT,
+                    new_status=InstanceStatus.IN_STORE,
+                    movement_type='UPWARD_TRANSFER' if stock_entry.is_upward_transfer else 'TRANSFER',
+                    moved_by=request.user,
+                    remarks=f"Acknowledged receipt from {stock_entry.from_location.name}",
+                    acknowledged=True,
+                    acknowledged_by=request.user,
+                    acknowledged_at=timezone.now()
+                )
+        
+        # Process rejected: Create return ISSUE entry
         if rejected_ids:
             rejected_instances = ItemInstance.objects.filter(id__in=rejected_ids)
+            
             return_entry = StockEntry.objects.create(
-                entry_type='RECEIPT',
+                entry_type='ISSUE',
                 from_location=stock_entry.to_location,
                 to_location=stock_entry.from_location,
                 item=stock_entry.item,
                 quantity=len(rejected_ids),
                 purpose=f"Rejected items from transfer {stock_entry.entry_number}",
+                remarks=f"Rejected by {request.user.get_full_name()}",
                 reference_entry=stock_entry,
                 status='PENDING_ACK',
                 created_by=request.user
             )
             return_entry.instances.set(rejected_instances)
+            
+            # Keep rejected instances in transit back to sender
+            for instance in rejected_instances:
+                instance.current_status = InstanceStatus.IN_TRANSIT
+                instance.current_location = stock_entry.from_location  # Route back
+                instance.save()
         
+        # Mark original transfer as completed
         stock_entry.status = 'COMPLETED'
         stock_entry.acknowledged_by = request.user
         stock_entry.acknowledged_at = timezone.now()
         stock_entry.save()
         
-        # Update inventories
+        # Update inventories for both locations
         self._update_inventories(stock_entry)
+        if accepted_ids:
+            # Update inventory for the receipt entry too
+            inv, _ = LocationInventory.objects.get_or_create(
+                location=stock_entry.to_location,
+                item=stock_entry.item
+            )
+            inv.update_quantities()
         
         message = f'Receipt acknowledged successfully. Accepted: {len(accepted_ids)}'
         if rejected_ids:
@@ -971,7 +1432,9 @@ class StockEntryViewSet(viewsets.ModelViewSet):
         return Response({
             'message': message,
             'accepted_count': len(accepted_ids),
-            'rejected_count': len(rejected_ids)
+            'rejected_count': len(rejected_ids),
+            'receipt_entry_created': accepted_ids and True,
+            'return_entry_created': rejected_ids and True
         })
 
 # ==================== ITEM INSTANCE VIEWSET ====================
@@ -1031,7 +1494,29 @@ class LocationInventoryViewSet(viewsets.ReadOnlyModelViewSet):
     
     def get_queryset(self):
         queryset = super().get_queryset()
+        user = self.request.user
         
+        if not hasattr(user, 'profile'):
+            return queryset.none()
+        
+        profile = user.profile
+        
+        # Filter inventory based on user role
+        if profile.role == UserRole.SYSTEM_ADMIN or profile.role == UserRole.AUDITOR:
+            # System admin and auditor can see all inventory
+            pass
+        elif profile.role == UserRole.LOCATION_HEAD:
+            # Location head sees inventory of stores in their hierarchy
+            accessible_stores = self._get_hierarchy_stores(profile)
+            queryset = queryset.filter(location__in=accessible_stores)
+        elif profile.role == UserRole.STOCK_INCHARGE:
+            # Stock incharge sees only their assigned stores
+            accessible_stores = profile.get_accessible_stores()
+            queryset = queryset.filter(location__in=accessible_stores)
+        else:
+            queryset = queryset.none()
+        
+        # Apply filters
         location = self.request.query_params.get('location')
         item = self.request.query_params.get('item')
         
@@ -1040,7 +1525,78 @@ class LocationInventoryViewSet(viewsets.ReadOnlyModelViewSet):
         if item:
             queryset = queryset.filter(item_id=item)
         
-        return queryset
+        return queryset.select_related('location', 'item')
+    
+    def _get_hierarchy_stores(self, profile):
+        """Get all stores in the location head's hierarchy"""
+        stores = []
+        
+        for location in profile.assigned_locations.all():
+            if location.is_standalone:
+                # Get main store
+                if location.auto_created_store:
+                    stores.append(location.auto_created_store)
+                
+                # Get all descendant stores
+                descendants = location.get_descendants(include_self=False)
+                descendant_stores = descendants.filter(is_store=True, is_active=True)
+                stores.extend(list(descendant_stores))
+                
+                # For root location, also get stores of immediate standalone children
+                if location.parent_location is None:
+                    standalone_children = location.get_standalone_children()
+                    for child in standalone_children:
+                        if child.auto_created_store:
+                            stores.append(child.auto_created_store)
+                        child_stores = child.get_descendants(include_self=False).filter(
+                            is_store=True, is_active=True
+                        )
+                        stores.extend(list(child_stores))
+        
+        # Remove duplicates
+        store_ids = list(set([s.id for s in stores]))
+        return Location.objects.filter(id__in=store_ids)
+    
+    @action(detail=False, methods=['get'])
+    def my_inventory(self, request):
+        """Get inventory based on user's role and location access"""
+        if not hasattr(request.user, 'profile'):
+            return Response({'error': 'Profile not found'}, status=404)
+        
+        profile = request.user.profile
+        
+        # Get stores based on role
+        if profile.role == UserRole.LOCATION_HEAD:
+            stores = self._get_hierarchy_stores(profile)
+        elif profile.role == UserRole.STOCK_INCHARGE:
+            stores = profile.get_accessible_stores()
+        elif profile.role in [UserRole.SYSTEM_ADMIN, UserRole.AUDITOR]:
+            stores = Location.objects.filter(is_store=True, is_active=True)
+        else:
+            stores = Location.objects.none()
+        
+        inventory = LocationInventory.objects.filter(
+            location__in=stores
+        ).select_related('location', 'item')
+        
+        # Group by location
+        inventory_by_location = {}
+        for inv in inventory:
+            loc_id = inv.location.id
+            if loc_id not in inventory_by_location:
+                inventory_by_location[loc_id] = {
+                    'location': LocationMinimalSerializer(inv.location).data,
+                    'items': []
+                }
+            inventory_by_location[loc_id]['items'].append(
+                LocationInventorySerializer(inv).data
+            )
+        
+        return Response({
+            'user_role': profile.role,
+            'stores_count': stores.count(),
+            'inventory_by_location': list(inventory_by_location.values())
+        })
 
 # ==================== USER ACTIVITY VIEWSET ====================
 class UserActivityViewSet(viewsets.ReadOnlyModelViewSet):

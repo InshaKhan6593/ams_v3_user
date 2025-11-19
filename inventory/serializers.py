@@ -397,6 +397,9 @@ class LocationMinimalSerializer(serializers.ModelSerializer):
                  'is_main_store', 'parent_location', 'is_standalone', 'is_root_location']
 
 
+# Location Serializer - FIXED VERSION
+# Add this to your serializers.py, replacing the LocationSerializer class
+
 class LocationSerializer(serializers.ModelSerializer):
     parent_location_name = serializers.CharField(source='parent_location.name', read_only=True)
     full_path = serializers.SerializerMethodField()
@@ -522,6 +525,14 @@ class LocationSerializer(serializers.ModelSerializer):
         is_store = data.get('is_store', False)
         is_standalone = data.get('is_standalone', False)
         
+        # FIX: Auto-set is_store = True if location_type is STORE
+        if location_type == LocationType.STORE:
+            data['is_store'] = True
+            is_store = True
+            # Force is_standalone to False for stores
+            data['is_standalone'] = False
+            is_standalone = False
+        
         if not request or not hasattr(request.user, 'profile'):
             raise serializers.ValidationError("User authentication required")
         
@@ -560,15 +571,8 @@ class LocationSerializer(serializers.ModelSerializer):
             # Root must be standalone
             if not is_standalone:
                 raise serializers.ValidationError({
-                    'is_standalone': "Root location must be marked as standalone"
+                    'is_standalone': "Root location must be standalone"
                 })
-            
-            # Only one root allowed
-            if Location.objects.filter(parent_location__isnull=True).exists():
-                if not self.instance or self.instance.parent_location is not None:
-                    raise serializers.ValidationError({
-                        'parent_location': "Only one root location is allowed"
-                    })
         
         return data
 
@@ -626,11 +630,28 @@ class ItemSerializer(serializers.ModelSerializer):
 
 
 # ==================== INSPECTION SERIALIZERS ====================
+# InspectionItem Serializer - UPDATED VERSION
+# Replace the InspectionItemSerializer in serializers.py
+
+# InspectionItem Serializer - 4-STAGE WORKFLOW VERSION
+# Replace the InspectionItemSerializer in serializers.py
+
+# InspectionItem Serializer - FIXED VERSION (No initial_data error)
+# Replace the InspectionItemSerializer in serializers.py
+
 class InspectionItemSerializer(serializers.ModelSerializer):
+    # CRITICAL: Make id writable so we can update existing items
+    id = serializers.IntegerField(required=False)
+
     item_name = serializers.CharField(source='item.name', read_only=True)
     item_code = serializers.CharField(source='item.code', read_only=True)
     item_unit = serializers.CharField(source='item.acct_unit', read_only=True)
     total_value = serializers.SerializerMethodField()
+    
+    # Add read-only flags to show which fields should be editable by which role
+    can_edit_basic_details = serializers.SerializerMethodField()
+    can_edit_stock_register = serializers.SerializerMethodField()
+    can_edit_central_register = serializers.SerializerMethodField()
     
     class Meta:
         model = InspectionItem
@@ -641,7 +662,82 @@ class InspectionItemSerializer(serializers.ModelSerializer):
             return float(obj.accepted_quantity * obj.unit_price)
         return None
     
+    def get_can_edit_basic_details(self, obj):
+        """
+        Basic item details can be edited by Location Head in INITIATED stage
+        """
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return False
+        
+        profile = request.user.profile
+        cert = obj.inspection_certificate
+        
+        if profile.role == UserRole.LOCATION_HEAD and cert.stage == 'INITIATED':
+            if profile.has_location_access(cert.department):
+                return True
+        
+        if profile.role == UserRole.SYSTEM_ADMIN:
+            return True
+        
+        return False
+        
+        if profile.role == UserRole.SYSTEM_ADMIN:
+            return True
+        
+        return False
+    
+    def get_can_edit_stock_register(self, obj):
+        """
+        Stock register details can be edited by department store incharge
+        in STOCK_DETAILS stage (NON-ROOT ONLY)
+        """
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return False
+        
+        profile = request.user.profile
+        cert = obj.inspection_certificate
+        
+        # STOCK_DETAILS stage should only exist for non-root certificates
+        if profile.role == UserRole.STOCK_INCHARGE and cert.stage == 'STOCK_DETAILS':
+            main_store = cert.get_main_store()
+            if main_store and profile.has_location_access(main_store):
+                # Must NOT be central store incharge
+                if not profile.is_main_store_incharge():
+                    return True
+        
+        if profile.role == UserRole.SYSTEM_ADMIN:
+            return True
+        
+        return False
+    
+    def get_can_edit_central_register(self, obj):
+        """
+        Central register details can be edited by central store incharge
+        in CENTRAL_REGISTER stage
+        """
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return False
+        
+        profile = request.user.profile
+        cert = obj.inspection_certificate
+        
+        if profile.role == UserRole.STOCK_INCHARGE and cert.stage == 'CENTRAL_REGISTER':
+            # MUST be central store incharge
+            if profile.is_main_store_incharge():
+                return True
+        
+        if profile.role == UserRole.SYSTEM_ADMIN:
+            return True
+        
+        return False
+    
     def validate(self, data):
+        """
+        Validate quantities and ensure proper field editing based on workflow stage
+        """
         tendered = data.get('tendered_quantity', 0)
         accepted = data.get('accepted_quantity', 0)
         rejected = data.get('rejected_quantity', 0)
@@ -651,8 +747,89 @@ class InspectionItemSerializer(serializers.ModelSerializer):
                 "Accepted + Rejected quantity cannot exceed tendered quantity"
             )
         
+        # Validate that only appropriate fields are being edited based on stage
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            profile = request.user.profile
+            
+            # Get the inspection certificate
+            inspection_cert = None
+            
+            if self.instance:
+                inspection_cert = self.instance.inspection_certificate
+            elif hasattr(self, 'parent') and self.parent and hasattr(self.parent, 'instance'):
+                inspection_cert = self.parent.instance
+            
+            if inspection_cert:
+                # STAGE 1: Location Head - Can edit basic details, NOT register fields
+                if profile.role == UserRole.LOCATION_HEAD and inspection_cert.stage == 'INITIATED':
+                    register_fields = [
+                        'stock_register_no', 'stock_register_page_no', 'stock_entry_date',
+                        'central_register_no', 'central_register_page_no'
+                    ]
+                    if any(field in data for field in register_fields):
+                        raise serializers.ValidationError({
+                            'error': 'Location Head cannot edit register fields. These will be filled in later stages.'
+                        })
+                
+                # STAGE 2: Department Store Incharge - Can ONLY edit stock register fields (NON-ROOT)
+                elif profile.role == UserRole.STOCK_INCHARGE and inspection_cert.stage == 'STOCK_DETAILS':
+                    if not profile.is_main_store_incharge():
+                        # Can only edit stock register fields
+                        allowed_fields = ['stock_register_no', 'stock_register_page_no', 'stock_entry_date']
+                        basic_fields = [
+                            'item', 'tendered_quantity', 'accepted_quantity', 
+                            'rejected_quantity', 'unit_price', 'remarks'
+                        ]
+                        central_fields = ['central_register_no', 'central_register_page_no']
+                        
+                        if any(field in data for field in basic_fields):
+                            raise serializers.ValidationError({
+                                'error': 'Stock Incharge cannot edit basic item details in STOCK_DETAILS stage.'
+                            })
+                        if any(field in data for field in central_fields):
+                            raise serializers.ValidationError({
+                                'error': 'Stock Incharge cannot edit central register details in STOCK_DETAILS stage.'
+                            })
+                
+                # STAGE 3: Central Store Incharge - Can ONLY edit central register fields
+                elif profile.role == UserRole.STOCK_INCHARGE and inspection_cert.stage == 'CENTRAL_REGISTER':
+                    if profile.is_main_store_incharge():
+                        # Can only edit central register fields
+                        allowed_fields = ['central_register_no', 'central_register_page_no']
+                        basic_fields = [
+                            'item', 'tendered_quantity', 'accepted_quantity', 
+                            'rejected_quantity', 'unit_price', 'remarks'
+                        ]
+                        stock_fields = ['stock_register_no', 'stock_register_page_no', 'stock_entry_date']
+                        
+                        if any(field in data for field in basic_fields):
+                            raise serializers.ValidationError({
+                                'error': 'Central Store Incharge cannot edit basic item details.'
+                            })
+                        if any(field in data for field in stock_fields):
+                            raise serializers.ValidationError({
+                                'error': 'Central Store Incharge cannot edit stock register details in CENTRAL_REGISTER stage.'
+                            })
+                
+                # STAGE 4: Auditor - Cannot edit item fields at all
+                elif profile.role == UserRole.AUDITOR and inspection_cert.stage == 'AUDIT_REVIEW':
+                    if data:
+                        raise serializers.ValidationError({
+                            'error': 'Auditor cannot edit item details in AUDIT_REVIEW stage.'
+                        })
+        
         return data
 
+
+# InspectionCertificate Serializer - UPDATED VERSION
+# Replace the InspectionCertificateSerializer in serializers.py
+
+# InspectionCertificate Serializer - 4-STAGE WORKFLOW VERSION
+# Replace the InspectionCertificateSerializer in serializers.py
+
+# InspectionCertificate Serializer - FIXED STAGE VALIDATION
+# Replace the InspectionCertificateSerializer in serializers.py
 
 class InspectionCertificateSerializer(serializers.ModelSerializer):
     inspection_items = InspectionItemSerializer(many=True, required=False)
@@ -681,6 +858,11 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
     total_rejected = serializers.SerializerMethodField()
     total_value = serializers.SerializerMethodField()
     
+    # New fields for 4-stage workflow
+    is_main_store_incharge = serializers.SerializerMethodField()
+    central_store_info = serializers.SerializerMethodField()
+    current_user_role_display = serializers.SerializerMethodField()
+    
     class Meta:
         model = InspectionCertificate
         fields = '__all__'
@@ -688,8 +870,48 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
             'certificate_no', 'stage', 'stage_history', 'initiated_by', 'initiated_at',
             'stock_filled_by', 'stock_filled_at', 'auditor_reviewed_by', 'auditor_reviewed_at',
             'rejected_by', 'rejected_at', 'created_by', 'acknowledged_by', 'acknowledged_at',
-            'created_at', 'updated_at'
+            'created_at', 'updated_at', 'is_root_department', 'workflow_type', 'current_handler'  # â† ADD THIS
         ]
+
+    # Add these to the serializer fields list
+    is_root_department = serializers.SerializerMethodField()
+    workflow_type = serializers.SerializerMethodField()
+    workflow_stages = serializers.SerializerMethodField()
+    current_stage_info = serializers.SerializerMethodField()
+    current_handler = serializers.SerializerMethodField()
+
+    def get_current_handler(self, obj):
+        """Get who should handle the current stage"""
+        is_root = obj.department.parent_location is None
+        
+        handlers = {
+            'INITIATED': 'Location Head',
+            'STOCK_DETAILS': 'Department Store Incharge',
+            'CENTRAL_REGISTER': 'Central Store Incharge',
+            'AUDIT_REVIEW': 'Auditor',
+            'COMPLETED': 'Completed',
+            'REJECTED': 'Rejected'
+        }
+        
+        handler = handlers.get(obj.stage, 'Unknown')
+        
+        # For root certs in CENTRAL_REGISTER, clarify it's the same as dept store
+        if is_root and obj.stage == 'CENTRAL_REGISTER':
+            handler += ' (Root Main Store)'
+        
+        return handler
+
+    def get_is_root_department(self, obj):
+        """
+        Check if this certificate's department is the root location.
+        Root location has no parent_location.
+        """
+        if obj.department:
+            is_root = obj.department.parent_location is None
+            # Debug logging
+            print(f"Serializer - Department: {obj.department.name}, Parent: {obj.department.parent_location}, Is Root: {is_root}")
+            return is_root
+        return False
     
     def get_department_full_path(self, obj):
         return obj.department.get_full_path() if obj.department else None
@@ -704,24 +926,113 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
         main_store = obj.get_main_store()
         return main_store.name if main_store else None
     
-    def get_can_edit(self, obj):
+    def get_is_main_store_incharge(self, obj):
+        """Check if current user is root/central main store incharge"""
         request = self.context.get('request')
         if request and hasattr(request.user, 'profile'):
-            return obj.can_edit_stage(request.user)
+            return request.user.profile.is_main_store_incharge()
+        return False
+    
+    def get_central_store_info(self, obj):
+        """Get information about the central/root store"""
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            profile = request.user.profile
+            if profile.is_main_store_incharge():
+                # Get the root location's main store
+                from inventory.models import Location
+                root = Location.objects.filter(parent_location__isnull=True).first()
+                if root:
+                    main_store = root.get_main_store()
+                    if main_store:
+                        return {
+                            'id': main_store.id,
+                            'name': main_store.name,
+                            'code': main_store.code
+                        }
+        return None
+    
+    def get_current_user_role_display(self, obj):
+        """Get current user's role for frontend display"""
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            profile = request.user.profile
+            role_display = profile.get_role_display()
+            if profile.role == UserRole.STOCK_INCHARGE and profile.is_main_store_incharge():
+                role_display += " (Central Store)"
+            return role_display
+        return None
+    
+    def get_can_edit(self, obj):
+        """
+        CRITICAL FIX: Department Store Incharge can edit in STOCK_DETAILS stage
+        """
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'profile'):
+            profile = request.user.profile
+            
+            # System Admin can always edit
+            if profile.role == UserRole.SYSTEM_ADMIN:
+                return True
+            
+            # Stage 1: Location Head
+            if obj.stage == 'INITIATED' and profile.role == UserRole.LOCATION_HEAD:
+                return profile.has_location_access(obj.department)
+            
+            # Stage 2: Department Store Incharge (CRITICAL FIX)
+            elif obj.stage == 'STOCK_DETAILS' and profile.role == UserRole.STOCK_INCHARGE:
+                # Must NOT be central store incharge
+                if profile.is_main_store_incharge():
+                    return False
+                
+                # Must have access to department's main store
+                main_store = obj.get_main_store()
+                return main_store and profile.has_location_access(main_store)
+            
+            # Stage 3: CENTRAL_REGISTER - Central Store Incharge
+            elif obj.stage == 'CENTRAL_REGISTER' and profile.role == UserRole.STOCK_INCHARGE:
+                return profile.is_main_store_incharge()
+            
+            # Stage 4: AUDIT_REVIEW - Auditor
+            elif obj.stage == 'AUDIT_REVIEW' and profile.role == UserRole.AUDITOR:
+                return True
+        
         return False
     
     def get_can_submit(self, obj):
+        """
+        Proper 4-STAGE + 3-STAGE workflow submission permissions
+        """
         request = self.context.get('request')
         if not request or not hasattr(request.user, 'profile'):
             return False
         
         profile = request.user.profile
         
+        # System admin can submit at any stage
+        if profile.role == UserRole.SYSTEM_ADMIN:
+            return True
+        
+        # Stage 1: Location Head can submit from INITIATED
         if obj.stage == 'INITIATED' and profile.role == UserRole.LOCATION_HEAD:
             return profile.has_location_access(obj.department)
+        
+        # Stage 2: Department Store Incharge can submit from STOCK_DETAILS (NON-ROOT ONLY)
         elif obj.stage == 'STOCK_DETAILS' and profile.role == UserRole.STOCK_INCHARGE:
+            # Must NOT be central store incharge
+            if profile.is_main_store_incharge():
+                return False
+            
+            # Must have access to the department's main store
             main_store = obj.get_main_store()
             return main_store and profile.has_location_access(main_store)
+        
+        # Stage 3: Central Store Incharge can submit from CENTRAL_REGISTER
+        elif obj.stage == 'CENTRAL_REGISTER' and profile.role == UserRole.STOCK_INCHARGE:
+            # MUST be central store incharge
+            return profile.is_main_store_incharge()
+        
+        # Stage 4: Auditor can submit from AUDIT_REVIEW
         elif obj.stage == 'AUDIT_REVIEW' and profile.role == UserRole.AUDITOR:
             return True
         
@@ -737,35 +1048,88 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
                 profile.role in [UserRole.AUDITOR, UserRole.SYSTEM_ADMIN])
     
     def get_editable_fields(self, obj):
+        """
+        UPDATED Workflow - Editable Fields by Stage
+        - Stage 1 (INITIATED): Location Head - basic info + consignee fields
+        - Stage 2 (STOCK_DETAILS): Dept Stock Incharge - only register details
+        - Stage 3 (CENTRAL_REGISTER): Central Store - register + central_store_entry_date
+        - Stage 4 (AUDIT_REVIEW): Auditor - only finance_check_date
+        """
         request = self.context.get('request')
         if not request or not hasattr(request.user, 'profile'):
             return []
         
-        if not obj.can_edit_stage(request.user):
+        profile = request.user.profile
+        
+        if not self.get_can_edit(obj):
             return []
         
+        is_root_cert = obj.department.parent_location is None
+        
+        # Stage 1: Location Head fills basic info + consignee fields
         if obj.stage == 'INITIATED':
-            return ['contractor_name', 'contractor_address', 'contract_no', 'contract_date',
-                    'indenter', 'indent_no', 'department', 'date', 'date_of_delivery',
-                    'delivery_type', 'remarks', 'certificate_image']
+            return [
+                'contractor_name', 'contractor_address', 'contract_no', 'contract_date',
+                'indenter', 'indent_no', 'department', 'date', 'date_of_delivery',
+                'delivery_type', 'remarks', 'certificate_image',
+                'inspection_items',
+                # Consignee fields now in Stage 1
+                'inspected_by', 'date_of_inspection', 'consignee_name', 'consignee_designation'
+            ]
         
+        # Stage 2: Department Store Incharge fills ONLY stock register details
         elif obj.stage == 'STOCK_DETAILS':
-            return ['inspection_items', 'inspected_by', 'date_of_inspection',
-                    'consignee_name', 'consignee_designation']
+            if not is_root_cert and profile.role == UserRole.STOCK_INCHARGE and not profile.is_main_store_incharge():
+                return [
+                    'inspection_items',  # For stock register fields in items only
+                ]
+            return []
         
+        # Stage 3: Central Store Incharge fills central register + entry date
+        elif obj.stage == 'CENTRAL_REGISTER':
+            if profile.role == UserRole.STOCK_INCHARGE and profile.is_main_store_incharge():
+                return [
+                    'inspection_items',  # For central register fields in items
+                    'central_store_entry_date'  # Added central store entry date
+                ]
+            return []
+        
+        # Stage 4: Auditor fills ONLY finance_check_date
         elif obj.stage == 'AUDIT_REVIEW':
-            return ['dead_stock_register_no', 'dead_stock_page_no', 'central_store_entry_date',
-                    'finance_check_date', 'supporting_documents']
+            if profile.role == UserRole.AUDITOR:
+                return [
+                    'finance_check_date'  # Only finance check date now
+                ]
+            return []
         
         return []
     
     def get_next_stage(self, obj):
+        """Get the next stage name based on certificate type"""
+        is_root_cert = obj.department.parent_location is None
+        
         stage_flow = {
-            'INITIATED': 'STOCK_DETAILS',
-            'STOCK_DETAILS': 'AUDIT_REVIEW',
-            'AUDIT_REVIEW': 'COMPLETED'
+            'INITIATED': {
+                'root': 'Central Register Entry',
+                'non_root': 'Stock Details Entry'
+            },
+            'STOCK_DETAILS': {
+                'root': None,  # Root certs skip this
+                'non_root': 'Central Register Entry'
+            },
+            'CENTRAL_REGISTER': {
+                'root': 'Auditor Review',
+                'non_root': 'Auditor Review'
+            },
+            'AUDIT_REVIEW': {
+                'root': 'Completion',
+                'non_root': 'Completion'
+            }
         }
-        return stage_flow.get(obj.stage)
+        
+        stage_info = stage_flow.get(obj.stage, {})
+        key = 'root' if is_root_cert else 'non_root'
+        return stage_info.get(key, 'Next Stage')
     
     def get_stage_progress(self, obj):
         stage_weights = {
@@ -792,6 +1156,88 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
             for item in obj.inspection_items.all()
         )
         return float(total) if total else None
+    
+    def get_is_root_department(self, obj):
+        """Check if this certificate's department is root location"""
+        return obj.department.parent_location is None
+
+    def get_workflow_type(self, obj):
+        """Determine workflow type based on department"""
+        is_root = obj.department.parent_location is None
+        return '3-stage (Root)' if is_root else '4-stage (Department)'
+
+    def get_workflow_stages(self, obj):
+        """Get list of workflow stages based on department type"""
+        is_root = obj.department.parent_location is None if obj.department else False
+        
+        if is_root:
+            return [
+                {'stage': 'INITIATED', 'label': 'Stage 1: Location Head', 'description': 'Basic Info & Items'},
+                {'stage': 'AUDIT_REVIEW', 'label': 'Stage 2: Central Store', 'description': 'Central Register'},
+                {'stage': 'COMPLETED', 'label': 'Stage 3: Auditor', 'description': 'Final Verification'}
+            ]
+        else:
+            return [
+                {'stage': 'INITIATED', 'label': 'Stage 1: Location Head', 'description': 'Basic Info & Items'},
+                {'stage': 'STOCK_DETAILS', 'label': 'Stage 2: Dept Store', 'description': 'Stock Register'},
+                {'stage': 'AUDIT_REVIEW', 'label': 'Stage 3: Central Store', 'description': 'Central Register'},
+                {'stage': 'COMPLETED', 'label': 'Stage 4: Auditor', 'description': 'Final Verification'}
+            ]
+
+    def get_current_stage_info(self, obj):
+        """Get detailed info about current stage"""
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'profile'):
+            return None
+        
+        profile = request.user.profile
+        is_root = obj.department.parent_location is None
+        
+        stage_info = {
+            'stage': obj.stage,
+            'stage_display': obj.get_stage_display(),
+            'is_root_flow': is_root,
+            'workflow_type': '3-stage (Root)' if is_root else '4-stage (Non-Root)',
+        }
+        
+        # Determine what action is needed and by whom
+        if obj.stage == 'INITIATED':
+            stage_info['action_needed'] = 'Submit to Stock Incharge'
+            stage_info['action_by'] = 'Location Head'
+            stage_info['next_stage'] = 'Central Store Registration' if is_root else 'Department Store Registration'
+            stage_info['can_edit'] = profile.role in [UserRole.LOCATION_HEAD, UserRole.SYSTEM_ADMIN]
+            
+        elif obj.stage == 'STOCK_DETAILS':
+            stage_info['action_needed'] = 'Submit Stock Details'
+            stage_info['action_by'] = 'Department Store Incharge'
+            stage_info['next_stage'] = 'Central Store Registration'
+            # Only dept store incharge can edit (not central store)
+            stage_info['can_edit'] = (
+                profile.role == UserRole.STOCK_INCHARGE and 
+                not profile.is_main_store_incharge()
+            ) or profile.role == UserRole.SYSTEM_ADMIN
+            
+        elif obj.stage == 'AUDIT_REVIEW':
+            # Check if central register is filled
+            has_central_register = obj.inspection_items.filter(
+                central_register_no__isnull=False
+            ).exists()
+            
+            if not has_central_register:
+                stage_info['action_needed'] = 'Fill Central Register'
+                stage_info['action_by'] = 'Central Store Incharge'
+                stage_info['next_stage'] = 'Auditor Review'
+                stage_info['can_edit'] = (
+                    profile.role == UserRole.STOCK_INCHARGE and 
+                    profile.is_main_store_incharge()
+                ) or profile.role == UserRole.SYSTEM_ADMIN
+            else:
+                stage_info['action_needed'] = 'Complete Audit'
+                stage_info['action_by'] = 'Auditor'
+                stage_info['next_stage'] = 'Completed'
+                stage_info['can_edit'] = profile.role in [UserRole.AUDITOR, UserRole.SYSTEM_ADMIN]
+        
+        return stage_info
     
     def validate_department(self, value):
         """Validate that department is standalone"""
@@ -835,6 +1281,8 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
         
         return inspection_cert
     
+    # Replace the update method in InspectionCertificateSerializer class
+
     @transaction.atomic
     def update(self, instance, validated_data):
         request = self.context.get('request')
@@ -842,24 +1290,42 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
         if request and hasattr(request.user, 'profile'):
             profile = request.user.profile
             
+            # STAGE 1: Location Head can only edit in INITIATED stage
             if profile.role == UserRole.LOCATION_HEAD:
                 if instance.stage != 'INITIATED':
                     raise serializers.ValidationError({
                         'error': f"Location Head cannot edit certificate after {instance.get_stage_display()} stage"
                     })
+            
+            # STAGE 2: Stock Incharge can edit in STOCK_DETAILS stage
+            elif profile.role == UserRole.STOCK_INCHARGE:
+                if instance.stage == 'STOCK_DETAILS':
+                    # Check if they have access to the department's main store
+                    main_store = instance.get_main_store()
+                    if not main_store or not profile.has_location_access(main_store):
+                        raise serializers.ValidationError({
+                            'error': "You don't have access to this certificate's location"
+                        })
+                    # Make sure they're not the central store incharge
+                    if profile.is_main_store_incharge():
+                        raise serializers.ValidationError({
+                            'error': "Central store incharge should not fill stock details. This is for the department's store incharge."
+                        })
                 
-                if 'inspection_items' in validated_data:
+                # STAGE 3: Central Store Incharge can edit in CENTRAL_REGISTER
+                elif instance.stage == 'CENTRAL_REGISTER':
+                    # Only central store incharge can edit here
+                    if not profile.is_main_store_incharge():
+                        raise serializers.ValidationError({
+                            'error': "Only central store incharge can edit in CENTRAL_REGISTER stage"
+                        })
+                else:
                     raise serializers.ValidationError({
-                        'inspection_items': "Location Head cannot add items. Items are filled by Stock Incharge."
+                        'error': "Stock Incharge can only edit in their designated stage"
                     })
             
-            if profile.role == UserRole.STOCK_INCHARGE:
-                if instance.stage != 'STOCK_DETAILS':
-                    raise serializers.ValidationError({
-                        'error': "Stock Incharge can only edit in STOCK_DETAILS stage"
-                    })
-            
-            if profile.role == UserRole.AUDITOR:
+            # STAGE 3B: Auditor can only edit in AUDIT_REVIEW
+            elif profile.role == UserRole.AUDITOR:
                 if instance.stage != 'AUDIT_REVIEW':
                     raise serializers.ValidationError({
                         'error': "Auditor can only edit in AUDIT_REVIEW stage"
@@ -879,23 +1345,92 @@ class InspectionCertificateSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         
+        # Handle inspection items update
         if inspection_items_data is not None:
             if request and hasattr(request.user, 'profile'):
                 profile = request.user.profile
-                if profile.role not in [UserRole.STOCK_INCHARGE, UserRole.SYSTEM_ADMIN]:
+                
+                # Only Location Head, Stock Incharge, and System Admin can manage items
+                if profile.role not in [UserRole.LOCATION_HEAD, UserRole.STOCK_INCHARGE, UserRole.SYSTEM_ADMIN]:
                     raise serializers.ValidationError({
-                        'inspection_items': "Only Stock Incharge can manage items"
+                        'inspection_items': "Only Location Head and Stock Incharge can manage items"
                     })
             
-            instance.inspection_items.all().delete()
+            # CRITICAL FIX: Don't create new items, only update existing ones
             for item_data in inspection_items_data:
-                InspectionItem.objects.create(
-                    inspection_certificate=instance,
-                    **item_data
-                )
+                item_id = item_data.get('id')
+                
+                if item_id:
+                    # Update existing item
+                    try:
+                        item = InspectionItem.objects.get(id=item_id, inspection_certificate=instance)
+                        
+                        # Control which fields can be updated based on stage and role
+                        if instance.stage == 'INITIATED':
+                            # Location Head can update all item fields except register numbers
+                            allowed_fields = [
+                                'item', 'tendered_quantity', 'accepted_quantity', 
+                                'rejected_quantity', 'unit_price', 'make_type', 'remarks'
+                            ]
+                        elif instance.stage == 'STOCK_DETAILS':
+                            # Stock Incharge can only update stock register fields
+                            allowed_fields = [
+                                'stock_register_no', 'stock_register_page_no', 'stock_entry_date'
+                            ]
+                        elif instance.stage == 'CENTRAL_REGISTER' and profile.role == UserRole.STOCK_INCHARGE:
+                            # Central Store Incharge can only update central register fields
+                            allowed_fields = [
+                                'central_register_no', 'central_register_page_no'
+                            ]
+                        else:
+                            allowed_fields = []
+                        
+                        # Update only allowed fields
+                        for field, value in item_data.items():
+                            if field != 'id' and field in allowed_fields:
+                                setattr(item, field, value)
+                        item.save()
+                        
+                    except InspectionItem.DoesNotExist:
+                        # Item doesn't exist - only allow creation in INITIATED stage
+                        if instance.stage == 'INITIATED':
+                            # Remove 'id' before creating
+                            item_data_without_id = {k: v for k, v in item_data.items() if k != 'id'}
+                            InspectionItem.objects.create(
+                                inspection_certificate=instance,
+                                **item_data_without_id
+                            )
+                else:
+                    # No ID provided - create new item (only in INITIATED stage)
+                    if instance.stage == 'INITIATED':
+                        # Ensure we have the item field
+                        if 'item' not in item_data:
+                            continue
+                        
+                        # Check if item already exists for this certificate
+                        existing_item = InspectionItem.objects.filter(
+                            inspection_certificate=instance,
+                            item_id=item_data.get('item')
+                        ).first()
+                        
+                        if existing_item:
+                            # Update existing item instead of creating
+                            allowed_fields = [
+                                'item', 'tendered_quantity', 'accepted_quantity', 
+                                'rejected_quantity', 'unit_price', 'make_type', 'remarks'
+                            ]
+                            for field, value in item_data.items():
+                                if field in allowed_fields:
+                                    setattr(existing_item, field, value)
+                            existing_item.save()
+                        else:
+                            # Create new item
+                            InspectionItem.objects.create(
+                                inspection_certificate=instance,
+                                **{k: v for k, v in item_data.items() if k != 'id'}
+                            )
         
         return instance
-
 
 class InspectionCertificateMinimalSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source='department.name', read_only=True)
@@ -1070,94 +1605,106 @@ class StockEntrySerializer(serializers.ModelSerializer):
         return False
     
     def validate(self, data):
-        entry_type = data.get('entry_type')
-        from_location = data.get('from_location')
-        to_location = data.get('to_location')
-        is_temporary = data.get('is_temporary', False)
-        
-        request = self.context.get('request')
-        if request and hasattr(request.user, 'profile'):
-            profile = request.user.profile
+            entry_type = data.get('entry_type')
+            from_location = data.get('from_location')
+            to_location = data.get('to_location')
+            is_temporary = data.get('is_temporary', False)
             
-            # Stock Incharge validation
-            if profile.role == UserRole.STOCK_INCHARGE:
-                accessible_stores = profile.get_accessible_stores()
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'profile'):
+                profile = request.user.profile
                 
-                if entry_type == 'ISSUE':
-                    # Validate from_location is an accessible store
-                    if from_location and from_location not in accessible_stores:
-                        raise serializers.ValidationError({
-                            'from_location': 'You can only issue from stores you manage'
-                        })
+                # Stock Incharge validation
+                if profile.role == UserRole.STOCK_INCHARGE:
+                    accessible_stores = profile.get_accessible_stores()
                     
-                    # Check if this is an upward transfer
-                    if from_location and to_location and from_location.is_main_store:
-                        parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
-                        if to_location == parent_standalone_for_issuance:
-                            # This is a valid upward transfer
-                            pass
-                        elif not profile.has_location_access(to_location):
-                            # Regular transfer - validate access
+                    if entry_type == 'ISSUE':
+                        # Validate from_location is an accessible store
+                        if from_location and from_location not in accessible_stores:
                             raise serializers.ValidationError({
-                                'to_location': f'You can only issue to locations within your hierarchy or to parent standalone location'
+                                'from_location': 'You can only issue from stores you manage'
                             })
-                
-                elif entry_type == 'RECEIPT':
-                    # Validate to_location is an accessible store
-                    if to_location and to_location not in accessible_stores:
-                        raise serializers.ValidationError({
-                            'to_location': 'You can only receive to stores you manage'
-                        })
-        
-        # Existing validation
-        if entry_type == 'RECEIPT':
-            if not to_location:
-                raise serializers.ValidationError({'to_location': "Receipt must have a destination location"})
-            if not to_location.is_store:
-                raise serializers.ValidationError({'to_location': "Receipt destination must be a store location"})
-        
-        elif entry_type == 'ISSUE':
-            if not from_location:
-                raise serializers.ValidationError({'from_location': "Issue must have a source location"})
-            if not from_location.is_store:
-                raise serializers.ValidationError({'from_location': "Issue source must be a store location"})
-            if not to_location:
-                raise serializers.ValidationError({'to_location': "Issue must have a destination location"})
+                        
+                        # CRITICAL FIX: Check if this is an upward transfer
+                        if from_location and to_location and from_location.is_main_store:
+                            parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
+                            
+                            # If to_location is the parent standalone, resolve to its main store
+                            if to_location == parent_standalone_for_issuance:
+                                # This is a valid upward transfer - get the main store
+                                target_main_store = to_location.get_main_store()
+                                if not target_main_store:
+                                    raise serializers.ValidationError({
+                                        'to_location': f'{to_location.name} does not have a main store'
+                                    })
+                                # Replace to_location with the main store
+                                data['to_location'] = target_main_store
+                            elif not profile.has_location_access(to_location):
+                                # Regular transfer - validate access
+                                raise serializers.ValidationError({
+                                    'to_location': f'You can only issue to locations within your hierarchy or to parent standalone location'
+                                })
+                    
+                    elif entry_type == 'RECEIPT':
+                        # Validate to_location is an accessible store
+                        if to_location and to_location not in accessible_stores:
+                            raise serializers.ValidationError({
+                                'to_location': 'You can only receive to stores you manage'
+                            })
             
-            # Check transfer permissions
-            if from_location and to_location:
-                # Check if upward transfer
-                if from_location.is_main_store:
-                    parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
-                    if to_location == parent_standalone_for_issuance:
-                        # Valid upward transfer
-                        pass
+            # Existing validation
+            if entry_type == 'RECEIPT':
+                if not to_location:
+                    raise serializers.ValidationError({'to_location': "Receipt must have a destination location"})
+                if not to_location.is_store:
+                    raise serializers.ValidationError({'to_location': "Receipt destination must be a store location"})
+            
+            elif entry_type == 'ISSUE':
+                if not from_location:
+                    raise serializers.ValidationError({'from_location': "Issue must have a source location"})
+                if not from_location.is_store:
+                    raise serializers.ValidationError({'from_location': "Issue source must be a store location"})
+                if not to_location:
+                    raise serializers.ValidationError({'to_location': "Issue must have a destination location"})
+                
+                # Check transfer permissions (after resolving standalone to main store)
+                if from_location and to_location:
+                    # Check if upward transfer
+                    if from_location.is_main_store:
+                        parent_standalone_for_issuance = from_location.get_parent_standalone_for_issuance()
+                        # Get parent standalone of to_location
+                        to_parent_standalone = to_location.get_parent_standalone()
+                        
+                        # Valid if transferring to parent standalone's main store
+                        if to_parent_standalone == parent_standalone_for_issuance:
+                            # Valid upward transfer
+                            pass
+                        elif not from_location.can_transfer_to(to_location):
+                            raise serializers.ValidationError({
+                                'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
+                            })
                     elif not from_location.can_transfer_to(to_location):
                         raise serializers.ValidationError({
                             'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
                         })
-                elif not from_location.can_transfer_to(to_location):
+                
+                if is_temporary:
+                    if not data.get('expected_return_date'):
+                        raise serializers.ValidationError({
+                            'expected_return_date': "Expected return date required for temporary issues"
+                        })
+                    if not data.get('temporary_recipient'):
+                        raise serializers.ValidationError({
+                            'temporary_recipient': "Recipient name required for temporary issues"
+                        })
+            
+            elif entry_type == 'CORRECTION':
+                if not data.get('reference_entry'):
                     raise serializers.ValidationError({
-                        'to_location': f"Transfer from {from_location.name} to {to_location.name} is not allowed"
+                        'reference_entry': "Correction must have a reference entry"
                     })
             
-            if is_temporary:
-                if not data.get('expected_return_date'):
-                    raise serializers.ValidationError({
-                        'expected_return_date': "Expected return date required for temporary issues"
-                    })
-                if not data.get('temporary_recipient'):
-                    raise serializers.ValidationError({
-                        'temporary_recipient': "Recipient name required for temporary issues"
-                    })
-        
-        elif entry_type == 'CORRECTION':
-            if not data.get('reference_entry'):
-                raise serializers.ValidationError({
-                    'reference_entry': "Correction must have a reference entry"
-                })
-        
-        return data
+            return data
     
     def validate_instances(self, value):
         """Validate instances are available for issue"""
