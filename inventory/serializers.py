@@ -596,6 +596,17 @@ class CategorySerializer(serializers.ModelSerializer):
         return obj.items.count()
 
 
+class CategoryDepreciationSerializer(serializers.Serializer):
+    """Separate serializer for depreciation calculations"""
+    opening_value = serializers.DecimalField(max_digits=15, decimal_places=2, required=True)
+    years = serializers.IntegerField(default=1, min_value=1, max_value=50)
+    
+    def calculate(self, category):
+        opening_value = self.validated_data['opening_value']
+        years = self.validated_data['years']
+        return category.calculate_wdv_depreciation(opening_value, years)
+
+
 # ==================== ITEM SERIALIZERS ====================
 class ItemMinimalSerializer(serializers.ModelSerializer):
     class Meta:
@@ -1823,6 +1834,7 @@ class StockEntrySerializer(serializers.ModelSerializer):
 class ItemInstanceSerializer(serializers.ModelSerializer):
     item_name = serializers.CharField(source='item.name', read_only=True)
     item_code = serializers.CharField(source='item.code', read_only=True)
+    category_name = serializers.CharField(source='item.category.name', read_only=True)
     current_location_name = serializers.CharField(source='current_location.name', read_only=True)
     source_location_name = serializers.CharField(source='source_location.name', read_only=True)
     location_path = serializers.SerializerMethodField()
@@ -1852,9 +1864,17 @@ class ItemInstanceSerializer(serializers.ModelSerializer):
     days_since_assigned = serializers.SerializerMethodField()
     days_until_return = serializers.SerializerMethodField()
     
-    # NEW: Return/rejection tracking
+    # Return/rejection tracking
     is_rejected = serializers.SerializerMethodField()
     rejection_details = serializers.SerializerMethodField()
+    
+    # ==================== DEPRECIATION FIELDS ====================
+    depreciation_rate = serializers.SerializerMethodField()
+    age_in_years = serializers.SerializerMethodField()
+    current_book_value = serializers.SerializerMethodField()
+    accumulated_depreciation = serializers.SerializerMethodField()
+    depreciation_info = serializers.SerializerMethodField()
+    depreciation_schedule = serializers.SerializerMethodField()
     
     condition_display = serializers.CharField(source='get_condition_display', read_only=True)
     created_by_name = serializers.CharField(source='created_by.get_full_name', read_only=True)
@@ -1903,7 +1923,6 @@ class ItemInstanceSerializer(serializers.ModelSerializer):
     def get_is_rejected(self, obj):
         """Check if instance is part of a rejected/return entry"""
         if obj.current_status == InstanceStatus.IN_TRANSIT:
-            # Check if there's a RETURN entry for this instance
             return_entry = StockEntry.objects.filter(
                 instances=obj,
                 entry_type='RETURN',
@@ -1930,6 +1949,51 @@ class ItemInstanceSerializer(serializers.ModelSerializer):
                     'rejected_at': return_entry.created_at,
                     'days_pending_return': (timezone.now() - return_entry.created_at).days
                 }
+        return None
+    
+    # ==================== DEPRECIATION SERIALIZER METHODS ====================
+    
+    def get_depreciation_rate(self, obj):
+        """Get depreciation rate from item's category"""
+        return float(obj.get_depreciation_rate())
+    
+    def get_age_in_years(self, obj):
+        """Get age of instance in years"""
+        return round(obj.get_age_in_years(), 2)
+    
+    def get_current_book_value(self, obj):
+        """Get current depreciated book value"""
+        value = obj.get_current_book_value()
+        return float(value) if value else None
+    
+    def get_accumulated_depreciation(self, obj):
+        """Get total accumulated depreciation"""
+        value = obj.get_accumulated_depreciation()
+        return float(value) if value else None
+    
+    def get_depreciation_info(self, obj):
+        """Get comprehensive depreciation information"""
+        return obj.get_depreciation_info()
+    
+    def get_depreciation_schedule(self, obj):
+        """
+        Get depreciation schedule for next 5 years.
+        Only include if explicitly requested to avoid overhead.
+        """
+        request = self.context.get('request')
+        if request and request.query_params.get('include_schedule') == 'true':
+            schedule = obj.get_depreciation_schedule(years=5)
+            # Convert Decimal to float for JSON serialization
+            return [
+                {
+                    'year': item['year'],
+                    'opening_value': float(item['opening_value']),
+                    'depreciation_rate': float(item['depreciation_rate']),
+                    'depreciation_amount': float(item['depreciation_amount']),
+                    'closing_value': float(item['closing_value'])
+                }
+                for item in schedule
+            ]
         return None
 
 

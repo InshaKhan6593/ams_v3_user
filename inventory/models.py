@@ -428,6 +428,12 @@ class Category(models.Model):
         blank=True,
         related_name='subcategories'
     )
+    depreciation_rate = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=0.00,
+        help_text="Annual depreciation rate in percentage (e.g., 10.00 for 10%)"
+    )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -437,6 +443,74 @@ class Category(models.Model):
 
     def __str__(self):
         return f"{self.name} - {self.code}"
+
+    def calculate_wdv_depreciation(self, opening_value, years=1):
+        """
+        Calculate depreciation using Written Down Value (WDV) method.
+        
+        Args:
+            opening_value (Decimal): The opening/current value of the asset
+            years (int): Number of years to calculate depreciation for
+            
+        Returns:
+            dict: Contains depreciation amount, closing value, and accumulated depreciation
+        """
+        from decimal import Decimal
+        
+        if self.depreciation_rate == 0:
+            return {
+                'depreciation_amount': Decimal('0.00'),
+                'closing_value': opening_value,
+                'accumulated_depreciation': Decimal('0.00')
+            }
+        
+        rate = self.depreciation_rate / Decimal('100')
+        current_value = Decimal(str(opening_value))
+        total_depreciation = Decimal('0.00')
+        
+        for _ in range(years):
+            year_depreciation = current_value * rate
+            total_depreciation += year_depreciation
+            current_value -= year_depreciation
+        
+        return {
+            'depreciation_amount': total_depreciation,
+            'closing_value': current_value,
+            'accumulated_depreciation': total_depreciation
+        }
+
+    def get_year_wise_depreciation(self, opening_value, years=5):
+        """
+        Get year-by-year depreciation breakdown using WDV method.
+        
+        Args:
+            opening_value (Decimal): The initial value of the asset
+            years (int): Number of years to project
+            
+        Returns:
+            list: Year-wise depreciation details
+        """
+        from decimal import Decimal
+        
+        schedule = []
+        rate = self.depreciation_rate / Decimal('100')
+        current_value = Decimal(str(opening_value))
+        
+        for year in range(1, years + 1):
+            year_depreciation = current_value * rate
+            closing_value = current_value - year_depreciation
+            
+            schedule.append({
+                'year': year,
+                'opening_value': current_value,
+                'depreciation_rate': self.depreciation_rate,
+                'depreciation_amount': year_depreciation,
+                'closing_value': closing_value
+            })
+            
+            current_value = closing_value
+        
+        return schedule
 
 class Item(models.Model):
     name = models.CharField(max_length=150)
@@ -856,7 +930,7 @@ class ItemInstance(models.Model):
         related_name='status_changed_instances'
     )
     
-    # ENHANCED: source_location must be a store (main store typically)
+    # Source and current location
     source_location = models.ForeignKey(
         'Location', 
         on_delete=models.PROTECT, 
@@ -921,8 +995,15 @@ class ItemInstance(models.Model):
         blank=True
     )
     
-    # Purchase info
+    # Purchase/Financial info
     purchase_date = models.DateField(null=True, blank=True)
+    purchase_value = models.DecimalField(
+        max_digits=15, 
+        decimal_places=2, 
+        null=True, 
+        blank=True,
+        help_text="Original purchase value/cost"
+    )
     warranty_expiry = models.DateField(null=True, blank=True)
     
     # Enhanced QR data
@@ -983,11 +1064,126 @@ class ItemInstance(models.Model):
         
         return f"{self.item.code}-{year}-{new_seq:04d}"
     
+    # ==================== DEPRECIATION METHODS ====================
+    
+    def get_age_in_years(self):
+        """Calculate the age of the instance in years"""
+        from datetime import date
+        
+        if not self.purchase_date:
+            return 0
+        
+        today = date.today()
+        age_days = (today - self.purchase_date).days
+        age_years = age_days / 365.25
+        
+        return age_years
+    
+    def get_depreciation_rate(self):
+        """Get depreciation rate from category"""
+        if self.item and self.item.category:
+            return self.item.category.depreciation_rate
+        return 0
+    
+    def get_current_book_value(self):
+        """
+        Calculate current book value using category's WDV method.
+        Returns the depreciated value based on purchase_value and age.
+        """
+        from decimal import Decimal
+        
+        # If no purchase value, return 0
+        if not self.purchase_value:
+            return Decimal('0.00')
+        
+        # If no depreciation rate, return original value
+        depreciation_rate = self.get_depreciation_rate()
+        if depreciation_rate == 0:
+            return self.purchase_value
+        
+        # Calculate years elapsed (rounded down)
+        age_years = self.get_age_in_years()
+        years_elapsed = int(age_years)
+        
+        # If purchased recently (less than 1 year), no depreciation yet
+        if years_elapsed == 0:
+            return self.purchase_value
+        
+        # Use category's WDV calculation method
+        result = self.item.category.calculate_wdv_depreciation(
+            opening_value=self.purchase_value,
+            years=years_elapsed
+        )
+        
+        return result['closing_value']
+    
+    def get_accumulated_depreciation(self):
+        """
+        Get total depreciation accumulated since purchase.
+        """
+        from decimal import Decimal
+        
+        if not self.purchase_value:
+            return Decimal('0.00')
+        
+        current_value = self.get_current_book_value()
+        return self.purchase_value - current_value
+    
+    def get_depreciation_schedule(self, years=5):
+        """
+        Get year-wise depreciation schedule for this instance.
+        Useful for reporting and forecasting.
+        """
+        if not self.purchase_value or not self.item.category:
+            return []
+        
+        return self.item.category.get_year_wise_depreciation(
+            opening_value=self.purchase_value,
+            years=years
+        )
+    
+    def get_depreciation_info(self):
+        """
+        Get comprehensive depreciation information for this instance.
+        Returns a dictionary with all depreciation-related data.
+        """
+        from decimal import Decimal
+        
+        if not self.purchase_value:
+            return {
+                'purchase_value': None,
+                'current_book_value': Decimal('0.00'),
+                'accumulated_depreciation': Decimal('0.00'),
+                'depreciation_rate': self.get_depreciation_rate(),
+                'age_in_years': self.get_age_in_years(),
+                'purchase_date': self.purchase_date,
+                'has_depreciation_data': False
+            }
+        
+        current_value = self.get_current_book_value()
+        accumulated = self.get_accumulated_depreciation()
+        
+        return {
+            'purchase_value': float(self.purchase_value),
+            'current_book_value': float(current_value),
+            'accumulated_depreciation': float(accumulated),
+            'depreciation_rate': float(self.get_depreciation_rate()),
+            'age_in_years': round(self.get_age_in_years(), 2),
+            'years_elapsed': int(self.get_age_in_years()),
+            'purchase_date': str(self.purchase_date) if self.purchase_date else None,
+            'depreciation_percentage': round((accumulated / self.purchase_value * 100), 2) if self.purchase_value > 0 else 0,
+            'has_depreciation_data': True
+        }
+    
+    # ==================== OTHER METHODS ====================
+    
     def generate_qr_code(self):
-        """Generate QR code with comprehensive instance information"""
+        """Generate QR code with comprehensive instance information including depreciation"""
         import qrcode
         from io import BytesIO
         import base64
+        
+        depreciation_info = self.get_depreciation_info() if self.purchase_value else None
         
         qr_data = {
             'instance_code': self.instance_code,
@@ -1004,6 +1200,8 @@ class ItemInstance(models.Model):
             'source_location_code': self.source_location.code,
             'condition': self.condition,
             'purchase_date': str(self.purchase_date) if self.purchase_date else None,
+            'purchase_value': str(self.purchase_value) if self.purchase_value else None,
+            'current_book_value': str(depreciation_info['current_book_value']) if depreciation_info else None,
             'warranty_expiry': str(self.warranty_expiry) if self.warranty_expiry else None,
             'created_at': str(self.created_at),
             'inspection_certificate': self.inspection_certificate.certificate_no if self.inspection_certificate else None,
